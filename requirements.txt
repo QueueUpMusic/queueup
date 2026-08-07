@@ -1,0 +1,11 @@
+Django>=5.2,<5.3
+daphne>=4.2,<5
+channels>=4.2,<5
+channels-redis>=4.2,<5
+psycopg[binary]>=3.2,<3.3
+requests>=2.32,<3
+whitenoise>=6.9,<7
+pywebpush>=2.0,<3
+qrcode[pil]>=8.2,<9
+Pillow>=11.2,<12
+pillow-heif>=1.1,<2

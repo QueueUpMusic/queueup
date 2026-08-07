@@ -1,0 +1,23 @@
+{% extends 'league/base.html' %}
+{% block title %}Voting complete{% endblock %}
+{% block content %}
+<section class="card voting-complete centered">
+  <div class="completion-check" aria-hidden="true">✓</div>
+  {% if no_votable_songs %}
+    <h1>Nothing to rate</h1>
+    <p class="muted">There are no eligible songs on your ballot right now.</p>
+  {% else %}
+    <h1>You're all caught up!</h1>
+    <p>Your votes have been saved successfully.</p>
+    <div class="completion-metrics"><strong>{{ voted_count }} of {{ eligible_count }}</strong><span>songs rated</span></div>
+  {% endif %}
+  {% if round.state == 'voting' %}
+    <p>Voting closes {{ round.voting_deadline|date:"D, M j · g:i A" }}.</p>
+    <strong class="large-countdown" data-countdown="{{ round.voting_deadline|date:'c' }}">—</strong>
+    <p class="muted">Results will appear after voting closes.</p>
+    <div class="button-row centered-buttons"><a class="button secondary" href="{% url 'round_detail' round.pk %}?review=1">Review or edit votes</a><a class="button primary" href="{% url 'round_detail' round.pk %}">Return to round</a></div>
+  {% else %}
+    <a class="button primary" href="{% url 'round_detail' round.pk %}">Return to round</a>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,10 @@
+{% extends 'league/base.html' %}{% block title %}Waiting for approval · QueueUp{% endblock %}{% block content %}
+<section class="card waiting-card centered">
+  <div class="big-icon">⏳</div>
+  <span class="pill">Account received</span>
+  <h1>Waiting for staff approval</h1>
+  <p class="lede">Your account has been created. A league admin needs to approve it before you can browse rounds, vote, or submit songs.</p>
+  <p class="muted">You can enable notifications now and QueueUp will alert this device as soon as you are approved.</p>
+  <div class="button-row centered-buttons"><a class="button primary" href="{% url 'notification_settings' %}">Enable notifications</a><form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="button secondary">Log out</button></form></div>
+</section>
+{% endblock %}

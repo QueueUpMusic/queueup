@@ -1,0 +1,13 @@
+{% extends 'league/base.html' %}{% block title %}Notifications · QueueUp{% endblock %}{% block content %}
+<section class="page-intro compact-intro"><span class="pill">Notifications</span><h1>Notifications</h1><p class="muted">Get round updates and reminders on this device.</p></section>
+<section class="card notification-card" data-push-settings data-vapid-key="{{ vapid_public_key }}">
+  <div class="big-icon"><svg class="icon"><use href="#i-bell"/></svg></div>
+  <h2>Device alerts</h2>
+  <p class="muted" data-push-status>Checking status…</p>
+  <div class="ios-push-help" data-ios-push-help hidden>
+    <strong>Use the Home Screen app</strong>
+    <ol><li>Open QueueUp in Safari.</li><li>Tap Share, then <b>Add to Home Screen</b>.</li><li>Open QueueUp from the new icon and return here.</li></ol>
+  </div>
+  <div class="button-row centered-buttons"><button class="button spotify" data-enable-push>Enable notifications</button><button class="button secondary" data-disable-push>Disable notifications</button></div>
+</section>
+{% endblock %}

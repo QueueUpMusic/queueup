@@ -1,0 +1,13 @@
+{% extends 'league/base.html' %}{% load league_tags %}{% block title %}Round stats · {{ round.prompt }}{% endblock %}{% block content %}
+<a class="back" href="{% url 'control_panel' %}"><svg class="icon"><use href="#i-arrow-left"/></svg> League control</a>
+<section class="control-hero round-status-hero"><div><span class="pill">Staff only</span><h1>Round stats</h1><p class="lede">{{ round.prompt }}</p><small>{{ round.season.name }} · {{ round.state|title }}</small></div><a class="button secondary" href="{% url 'round_detail' round.pk %}">Open round</a></section>
+<div class="metric-grid round-status-metrics"><div class="metric"><strong>{{ player_count }}</strong><span>Players</span></div><div class="metric"><strong>{{ submitted_count }}</strong><span>Submitted</span></div><div class="metric"><strong>{{ completed_count }}</strong><span>Voting complete</span></div></div>
+<section class="control-section"><div class="section-heading"><div><h2>Player status</h2><p class="muted">Submission choices are visible here even before the round reveal.</p></div><span>{{ rows|length }} total</span></div>
+<div class="round-status-list">
+{% for row in rows %}<article class="card round-status-row">
+<div class="round-status-player">{% include 'league/partials/avatar.html' with user_obj=row.player avatar_class='avatar-sm' %}<div><strong>{{ row.player.first_name|default:row.player.username }} {% name_badges row.player %}</strong><small>@{{ row.player.username }}{% if not row.player.is_active %} · Inactive{% endif %}{% if row.player.is_staff %} · Staff{% endif %}</small></div></div>
+<div class="round-status-submission">{% if row.submission %}{% if row.submission.album_art_url %}<img src="{{ row.submission.album_art_url }}" alt="">{% endif %}<div><span class="status-label">Submitted</span><strong>{{ row.submission.title }}</strong><small>{{ row.submission.artist }} · {{ row.submission.submitted_at|date:"M j, g:i A" }}</small></div>{% else %}<div><span class="status-label muted">Submission</span><strong class="muted">No submission</strong></div>{% endif %}</div>
+<div class="round-status-voting"><span class="status-label">Voting</span>{% if row.voting_complete %}<strong class="status-complete"><svg class="icon"><use href="#i-check"/></svg> Complete</strong>{% elif row.voting_started %}<strong class="status-progress">In progress</strong>{% else %}<strong class="status-missing">Not started</strong>{% endif %}<small>{{ row.voted_count }} of {{ row.eligible_count }} eligible songs rated</small></div>
+</article>{% empty %}<div class="card centered"><p>No players found.</p></div>{% endfor %}
+</div></section>
+{% endblock %}

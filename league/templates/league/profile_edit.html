@@ -1,0 +1,135 @@
+{% extends 'league/base.html' %}
+{% block title %}Edit profile · QueueUp{% endblock %}
+{% block content %}
+<section class="page-heading"><div><span class="eyebrow">Your account</span><h1>Edit profile</h1><p>Choose the name and picture other players see beside your picks and scores.</p></div></section>
+<div class="profile-editor-stack">
+  <section class="card form-card profile-editor">
+    <div><span class="eyebrow">Display name</span><h2>Edit your name</h2><p class="muted">This is the name other players see throughout QueueUp.</p></div>
+    <form method="post" action="{% url 'profile_edit' %}" class="app-form">{% csrf_token %}{{ form.as_p }}<div class="form-actions"><button class="button primary" type="submit"><svg class="icon"><use href="#i-check"/></svg>Save profile</button><a class="button ghost" href="{% url 'stats' %}">Cancel</a></div></form>
+  </section>
+
+  <section class="card form-card profile-editor">
+    <div class="profile-picture-preview">{% include 'league/partials/avatar.html' with user_obj=user avatar_class='avatar-xl' %}<div><strong>Current picture</strong><small>Square images work best.</small></div></div>
+    <div class="profile-picture-actions">
+      <div><span class="eyebrow">Profile picture</span><h2>Upload a new picture</h2><p class="muted">Choose a photo or screenshot. QueueUp accepts JPG/JPEG, HEIC/HEIF, PNG, GIF, or WebP images up to 5 MB.</p></div>
+      <form method="post" action="{% url 'profile_picture_upload' %}" enctype="multipart/form-data" class="app-form" data-profile-picture-upload data-success-url="{% url 'profile_edit' %}">
+        <p><label for="id_picture">Profile picture:</label><input type="file" name="picture" accept="image/*,.jpg,.jpeg,.heic,.heif,.png,.gif,.webp" required id="id_picture"></p>
+        <p class="profile-upload-status muted" role="status" aria-live="polite" hidden></p>
+        <div class="form-actions"><button class="button primary" type="submit"><svg class="icon"><use href="#i-check"/></svg>Upload picture</button></div>
+      </form>
+      {% if user.profile.picture %}
+      <form method="post" action="{% url 'profile_picture_remove' %}" class="profile-picture-remove">{% csrf_token %}<button class="button ghost danger" type="submit">Remove current picture</button></form>
+      {% endif %}
+    </div>
+  </section>
+</div>
+<script>
+(() => {
+  const form = document.querySelector('[data-profile-picture-upload]');
+  if (!form || !window.fetch || !window.Blob) return;
+
+  const input = form.querySelector('input[type="file"]');
+  const button = form.querySelector('button[type="submit"]');
+  const status = form.querySelector('.profile-upload-status');
+  const maxBytes = 5 * 1024 * 1024;
+  const directlySupported = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+  const mimeAliases = new Map([['image/jpg', 'image/jpeg'], ['image/pjpeg', 'image/jpeg']]);
+  const heifTypes = new Set(['image/heic', 'image/heif', 'image/heic-sequence', 'image/heif-sequence']);
+  const heifExtensions = new Set(['heic', 'heif']);
+  const mimeByExtension = new Map([
+    ['jpg', 'image/jpeg'], ['jpeg', 'image/jpeg'],
+    ['png', 'image/png'], ['gif', 'image/gif'], ['webp', 'image/webp'],
+  ]);
+
+  const showStatus = (message, isError = false) => {
+    status.textContent = message;
+    status.hidden = false;
+    status.classList.toggle('is-error', isError);
+  };
+
+  const loadImage = file => new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => { URL.revokeObjectURL(url); resolve(image); };
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('This photo format could not be prepared. Try a screenshot or JPG instead.')); };
+    image.src = url;
+  });
+
+  const canvasBlob = (canvas, quality) => new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', quality));
+
+  const convertToJpeg = async file => {
+    const image = await loadImage(file);
+    const largestSide = Math.max(image.naturalWidth, image.naturalHeight);
+    const scale = Math.min(1, 2048 / largestSide);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const context = canvas.getContext('2d');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    let blob = await canvasBlob(canvas, 0.86);
+    if (blob && blob.size > maxBytes) blob = await canvasBlob(canvas, 0.68);
+    if (!blob || blob.size > maxBytes) throw new Error('The prepared picture is still larger than 5 MB. Choose a smaller image.');
+    const baseName = (file.name || 'profile-picture').replace(/\.[^.]+$/, '');
+    return {blob, name: `${baseName}.jpg`};
+  };
+
+  const prepareFile = async file => {
+    const originalName = file.name || 'profile-picture';
+    const extension = originalName.includes('.') ? originalName.split('.').pop().toLowerCase() : '';
+    const extensionType = mimeByExtension.get(extension) || '';
+    const reportedType = (file.type || '').toLowerCase();
+    const type = mimeAliases.get(reportedType) ||
+      ((!reportedType || reportedType === 'application/octet-stream') && extensionType ? extensionType : reportedType);
+
+    // Safari can rename an HEIF photo to .jpeg without actually converting its bytes.
+    // Send the original bytes so the server can decode HEIF and create a real JPEG.
+    if ((heifTypes.has(reportedType) || heifExtensions.has(extension)) && file.size <= maxBytes) {
+      return {blob: file, name: originalName};
+    }
+
+    if (directlySupported.has(type) && file.size <= maxBytes) {
+      const baseName = originalName.replace(/\.[^.]+$/, '') || 'profile-picture';
+      const normalizedName = type === 'image/jpeg' ? `${baseName}.jpg` : originalName;
+      const blob = reportedType === type ? file : new Blob([file], {type});
+      return {blob, name: normalizedName};
+    }
+    if (type && !type.startsWith('image/') && !extensionType) throw new Error('Please choose an image file.');
+    return convertToJpeg(file);
+  };
+
+  form.addEventListener('submit', async event => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    event.preventDefault();
+    button.disabled = true;
+    showStatus('Preparing picture…');
+
+    try {
+      const prepared = await prepareFile(file);
+      showStatus('Uploading picture…');
+      const response = await fetch(form.action, {
+        method: 'POST',
+        credentials: 'same-origin',
+        body: prepared.blob,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': prepared.blob.type || 'application/octet-stream',
+          'X-QueueUp-Raw-Upload': '1',
+          'X-QueueUp-Filename': encodeURIComponent(prepared.name),
+        },
+      });
+      const contentType = response.headers.get('content-type') || '';
+      const result = contentType.includes('application/json') ? await response.json() : null;
+      if (!response.ok || !result || !result.ok) throw new Error((result && result.error) || 'The picture could not be uploaded. Please try again.');
+      showStatus('Upload complete.');
+      window.location.assign(result.redirect || form.dataset.successUrl);
+    } catch (error) {
+      showStatus(error.message || 'The picture could not be uploaded. Please try again.', true);
+      button.disabled = false;
+    }
+  });
+})();
+</script>
+{% endblock %}

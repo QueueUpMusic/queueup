@@ -1,0 +1,50 @@
+<section class="hero-card state-glow-{{ card_round.state }}{% if is_results_card %} home-results-card{% endif %}" data-live-round="{{ card_round.id }}">
+  <div class="eyebrow-row">
+    <span class="pill">{{ card_round.season.name }}</span>
+    <span class="state state-{{ card_round.state }}">{% if is_results_card %}Results{% else %}{{ card_round.state|title }}{% endif %}</span>
+  </div>
+  <h1>{{ card_round.prompt }}</h1>
+  {% if card_round.details %}<p class="lede">{{ card_round.details }}</p>{% endif %}
+
+  <div class="countdown-panel">
+    <span>{% if is_results_card %}Round revealed{% elif card_round.state == 'upcoming' %}Submissions open in{% elif card_round.state == 'submitting' %}Submissions close in{% elif card_round.state == 'voting' %}Voting closes in{% elif card_round.state == 'locked' %}Reveal begins in{% else %}Revealed{% endif %}</span>
+    {% if is_results_card %}
+      <strong>{{ card_round.reveal_at|date:"M j, Y · g:i:s A" }}</strong>
+    {% elif card_round.state == 'upcoming' %}
+      <strong data-countdown="{{ card_round.submission_opens|date:'c' }}">—</strong>
+    {% elif card_round.state == 'submitting' %}
+      <strong data-countdown="{{ card_round.submission_deadline|date:'c' }}">—</strong>
+    {% elif card_round.state == 'voting' %}
+      <strong data-countdown="{{ card_round.voting_deadline|date:'c' }}">—</strong>
+    {% elif card_round.state == 'locked' %}
+      <strong data-countdown="{{ card_round.reveal_at|date:'c' }}">—</strong>
+    {% else %}
+      <strong>{{ card_round.reveal_at|date:"M j, Y · g:i:s A" }}</strong>
+    {% endif %}
+  </div>
+
+  <div class="metric-strip">
+    <div><strong data-live-submissions>{{ card_round.submissions.count }}</strong><span>Songs</span></div>
+    <div><strong data-live-votes>{{ card_round.votes.count }}</strong><span>Ratings</span></div>
+    <div><strong>{% if card_round.host %}<span class="metric-user">{% include 'league/partials/avatar.html' with user_obj=card_round.host avatar_class='avatar-xs' %}{{ card_round.host.first_name|default:card_round.host.username }}</span>{% else %}League{% endif %}</strong><span>Host</span></div>
+  </div>
+
+  {% if is_results_card %}
+    <a class="button primary" href="{% url 'round_detail' card_round.pk %}">See the results <svg class="icon"><use href="#i-arrow-right"/></svg></a>
+  {% elif card_round.state == 'submitting' %}
+    {% if submission %}
+      <div class="submitted"><img src="{{ submission.album_art_url }}" alt=""><div><strong>Song locked in</strong><span>Your pick stays secret until reveal.</span></div><span class="check"><svg class="icon"><use href="#i-check"/></svg></span></div>
+    {% else %}
+      <a class="button primary" href="{% url 'song_picker' card_round.pk %}">Choose your song <svg class="icon"><use href="#i-arrow-right"/></svg></a>
+    {% endif %}
+  {% elif card_round.state == 'voting' %}
+    <a class="button primary" href="{% url 'round_detail' card_round.pk %}">Start voting <svg class="icon"><use href="#i-arrow-right"/></svg></a>
+  {% elif card_round.state == 'revealed' %}
+    <a class="button primary" href="{% url 'round_detail' card_round.pk %}">See the reveal <svg class="icon"><use href="#i-arrow-right"/></svg></a>
+  {% endif %}
+
+  <div class="button-row">
+    <a class="button ghost" href="{% url 'round_detail' card_round.pk %}">Round details</a>
+    {% if not is_results_card %}<a class="button ghost" href="{% url 'notification_settings' %}">Notifications</a>{% endif %}
+  </div>
+</section>

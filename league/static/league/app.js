@@ -1,0 +1,115 @@
+document.addEventListener('DOMContentLoaded',()=>{
+ const toast=(msg)=>{const root=document.querySelector('#toast-stack'),el=document.createElement('div');el.className='toast';el.textContent=msg;root.append(el);setTimeout(()=>el.remove(),3800)};
+ document.querySelectorAll('[data-countdown]').forEach(el=>{const target=new Date(el.dataset.countdown).getTime();const tick=()=>{let d=Math.max(0,target-Date.now());const days=Math.floor(d/86400000),h=Math.floor(d/3600000)%24,m=Math.floor(d/60000)%60,s=Math.floor(d/1000)%60,p=n=>String(n).padStart(2,'0');el.textContent=`${days}d ${p(h)}h ${p(m)}m ${p(s)}s`;if(d===0&&!el.dataset.done){el.dataset.done='1';setTimeout(()=>location.reload(),1200)}};tick();setInterval(tick,1000)});
+ const searchRoot=document.querySelector('[data-search-url]');if(searchRoot){const input=document.querySelector('#song-search'),results=document.querySelector('#search-results'),template=document.querySelector('#track-template'),spinner=document.querySelector('.search-spinner');let timer,controller;const render=tracks=>{results.innerHTML='';if(!tracks.length){results.innerHTML='<div class="card centered"><h2>No songs found</h2><p class="muted">Try another spelling, artist, album, or Spotify link.</p></div>';return}tracks.forEach(t=>{const node=template.content.cloneNode(true),article=node.querySelector('.track'),img=node.querySelector('img');img.src=t.art||'';img.hidden=!t.art;node.querySelector('strong').textContent=t.title;node.querySelector('span').textContent=t.artist;node.querySelector('small').textContent=t.album;node.querySelector('input[name=track_id]').value=t.id;const form=node.querySelector('form'),button=form.querySelector('button');if(t.used){article.classList.add('disabled');form.remove();article.insertAdjacentHTML('beforeend','<span class="used">Already taken</span>')}else if(t.explicit){article.classList.add('disabled','explicit-track');form.dataset.explicit='1';button.type='button';button.classList.remove('primary');button.classList.add('secondary','explicit-choice');button.setAttribute('aria-disabled','true');button.textContent='Explicit'}results.append(node)})};input.addEventListener('input',()=>{clearTimeout(timer);const q=input.value.trim();if(q.length<2)return;timer=setTimeout(async()=>{controller?.abort();controller=new AbortController();spinner.hidden=false;try{const r=await fetch(`${searchRoot.dataset.searchUrl}?q=${encodeURIComponent(q)}&round=${searchRoot.dataset.round}`,{signal:controller.signal});const d=await r.json();render(d.tracks||[])}catch(e){if(e.name!=='AbortError')results.innerHTML='<div class="flash error">Spotify search failed.</div>'}finally{spinner.hidden=true}},220)})}
+ const cards=[...document.querySelectorAll('[data-card]')];if(cards.length){document.querySelectorAll('.star-picker').forEach(picker=>{const hidden=picker.querySelector('input[name=score]'),stars=[...picker.querySelectorAll('.rating-star')];const paint=value=>stars.forEach(star=>{const on=Number(star.dataset.ratingValue)<=Number(value);star.classList.toggle('active',on);star.setAttribute('aria-checked',String(Number(star.dataset.ratingValue)===Number(value)))});stars.forEach(star=>{star.addEventListener('click',()=>{hidden.value=star.dataset.ratingValue;paint(hidden.value)});star.addEventListener('pointerenter',()=>stars.forEach(s=>s.classList.toggle('preview',Number(s.dataset.ratingValue)<=Number(star.dataset.ratingValue))));star.addEventListener('pointerleave',()=>stars.forEach(s=>s.classList.remove('preview')))});paint(hidden.value);});let index=0;const label=document.querySelector('[data-card-index]');let spotifyApi=null;
+ const playerOptions=wrapper=>({uri:wrapper.dataset.spotifyUri,width:'100%',height:152});
+ const mountSpotifyPlayer=wrapper=>{if(!spotifyApi||wrapper._spotifyMounting||wrapper._spotifyController)return;let host=wrapper.querySelector('.spotify-api-player');if(!host){host=document.createElement('div');host.className='spotify-api-player';host.setAttribute('aria-label','Spotify preview for mystery song');wrapper.replaceChildren(host)}wrapper._spotifyMounting=true;spotifyApi.createController(host,playerOptions(wrapper),controller=>{wrapper._spotifyMounting=false;wrapper._spotifyController=controller;wrapper._spotifyPaused=true;controller.addListener?.('playback_update',event=>{const data=event?.data||event||{};if(typeof data.isPaused==='boolean')wrapper._spotifyPaused=data.isPaused})})};
+ const resetSpotifyPlayer=wrapper=>{try{wrapper._spotifyController?.destroy?.()}catch(_){}wrapper._spotifyController=null;wrapper._spotifyMounting=false;const host=document.createElement('div');host.className='spotify-api-player';host.setAttribute('aria-label','Spotify preview for mystery song');wrapper.replaceChildren(host)};
+ const pauseSpotifyPlayer=wrapper=>{if(!wrapper)return;const controller=wrapper._spotifyController;if(controller?.pause){try{controller.pause();setTimeout(()=>{if(wrapper._spotifyController===controller&&wrapper._spotifyPaused===false)resetSpotifyPlayer(wrapper)},450);return}catch(_){}}resetSpotifyPlayer(wrapper)};
+ const pauseHiddenPreviews=activeIndex=>{cards.forEach((card,n)=>{const wrapper=card.querySelector('[data-spotify-player]');if(!wrapper)return;if(n!==activeIndex)pauseSpotifyPlayer(wrapper);else mountSpotifyPlayer(wrapper)})};
+ const priorSpotifyReady=window.onSpotifyIframeApiReady;window.onSpotifyIframeApiReady=IFrameAPI=>{spotifyApi=IFrameAPI;if(typeof priorSpotifyReady==='function')priorSpotifyReady(IFrameAPI);cards.forEach(card=>mountSpotifyPlayer(card.querySelector('[data-spotify-player]')))};
+ const show=i=>{const nextIndex=Math.max(0,Math.min(cards.length-1,i));if(nextIndex!==index)pauseSpotifyPlayer(cards[index]?.querySelector('[data-spotify-player]'));index=nextIndex;cards.forEach((c,n)=>c.classList.toggle('current',n===index));pauseHiddenPreviews(index);if(label)label.textContent=`${index+1} / ${cards.length}`};show(0);document.querySelector('[data-prev]')?.addEventListener('click',()=>show(index-1));document.querySelector('[data-next]')?.addEventListener('click',()=>show(index+1));let startX=0;cards.forEach(c=>{c.addEventListener('touchstart',e=>startX=e.touches[0].clientX,{passive:true});c.addEventListener('touchend',e=>{const dx=e.changedTouches[0].clientX-startX;if(Math.abs(dx)>55)show(index+(dx<0?1:-1))},{passive:true})});const submit=async form=>{const button=form.querySelector('button[type=submit],button:not([type])'),status=form.querySelector('[data-rating-status]');if(!form.querySelector('input[name=score]').value){status.textContent='Choose a rating first.';return}button.disabled=true;status.textContent='Saving…';try{const r=await fetch(form.action,{method:'POST',body:new FormData(form),headers:{'X-Requested-With':'XMLHttpRequest'}});const data=await r.json().catch(()=>({}));if(!r.ok)throw Error(data.error||'Could not save. Tap a star to try again.');const card=form.closest('[data-card]');card.dataset.voted='1';const count=document.querySelector('[data-voted-count]');count.textContent=data.voted_count;document.querySelector('[data-progress]').style.width=`${data.eligible_count?data.voted_count/data.eligible_count*100:0}%`;status.textContent='✓ Saved';button.disabled=false;toast('Vote saved');if(data.complete){setTimeout(()=>location.assign(data.complete_url),350)}else{setTimeout(()=>show(index+1),320)}}catch(error){button.disabled=false;status.textContent=error.message||'Could not save. Tap a star to try again.'}};document.querySelectorAll('.ajax-vote').forEach(f=>f.addEventListener('submit',e=>{e.preventDefault();submit(f)}));document.addEventListener('keydown',e=>{if(e.key==='ArrowLeft')show(index-1);if(e.key==='ArrowRight')show(index+1);if(/[1-5]/.test(e.key)){const star=cards[index].querySelector(`.rating-star[data-rating-value="${e.key}"]`);if(star)star.click()}if(e.key==='Enter'&&document.activeElement.tagName!=='INPUT'){const f=cards[index].querySelector('form');if(f&&f.querySelector('input[name=score]').value)submit(f)}})}
+ if(document.querySelector('[data-reveal]')){const canvas=document.querySelector('#confetti-canvas'),ctx=canvas?.getContext('2d');if(ctx){const colors=['#1ed760','#ffffff','#ffd765','#49a7ff'];let width=innerWidth,height=innerHeight;const resize=()=>{width=innerWidth;height=innerHeight;canvas.width=width;canvas.height=height};resize();addEventListener('resize',resize);const bits=Array.from({length:150},(_,i)=>({x:Math.random()*width,y:-20-Math.random()*height*.85,v:2.2+Math.random()*4.6,drift:(Math.random()-.5)*1.6,r:3+Math.random()*4,a:Math.random()*Math.PI*2,spin:(Math.random()-.5)*.18,color:colors[i%colors.length]}));const started=performance.now(),duration=6500;const draw=now=>{ctx.clearRect(0,0,width,height);let visible=false;bits.forEach(b=>{b.y+=b.v;b.x+=b.drift+Math.sin(b.a)*.7;b.a+=b.spin;if(b.y<height+30){visible=true;ctx.save();ctx.translate(b.x,b.y);ctx.rotate(b.a);ctx.fillStyle=b.color;ctx.fillRect(-b.r/2,-b.r,b.r,b.r*2);ctx.restore()}});if(now-started<duration&&visible){requestAnimationFrame(draw)}else{ctx.clearRect(0,0,width,height);canvas.classList.add('confetti-finished')}};requestAnimationFrame(draw)}}
+ const push=document.querySelector('[data-push-settings]');if(push){
+  const status=push.querySelector('[data-push-status]'),enable=push.querySelector('[data-enable-push]'),disable=push.querySelector('[data-disable-push]'),iosHelp=push.querySelector('[data-ios-push-help]');
+  const isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1),standalone=matchMedia('(display-mode: standalone)').matches||navigator.standalone===true,supported='serviceWorker'in navigator&&'PushManager'in window&&'Notification'in window;
+  const b64=s=>{const pad='='.repeat((4-s.length%4)%4),raw=atob((s+pad).replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from([...raw].map(c=>c.charCodeAt(0)))},reg=()=>navigator.serviceWorker.register('/service-worker.js',{scope:'/'}),csrf=()=>decodeURIComponent(document.cookie.match(/(?:^|;\s*)queueup_csrftoken_v2=([^;]+)/)?.[1]||'');
+  const state=(message,kind='neutral',canEnable=false,canDisable=false)=>{status.textContent=message;status.dataset.state=kind;enable.hidden=!canEnable;disable.hidden=!canDisable;enable.disabled=false;disable.disabled=false};
+  const refresh=async()=>{state('Checking status…');if(!window.isSecureContext)return state('Notifications require HTTPS.','error');if(!supported)return state('Notifications are not supported by this browser.','error');if(isIOS&&!standalone){if(iosHelp)iosHelp.hidden=false;return state('Add QueueUp to your Home Screen, then open the app to enable notifications.','warning')}if(iosHelp)iosHelp.hidden=true;if(Notification.permission==='denied')return state('Permission blocked in browser settings.','error');try{const registration=await reg(),subscription=await registration.pushManager.getSubscription();if(subscription&&Notification.permission==='granted')state('Notifications are enabled on this device.','success',false,true);else state('Notifications are disabled on this device.','neutral',true,false)}catch(error){state(`Could not check notifications: ${error.message}`,'error',true,false)}};
+  enable.onclick=async()=>{enable.disabled=true;state('Checking status…');try{if(isIOS&&!standalone)throw Error('Open QueueUp from the Home Screen app to enable notifications.');if(!window.isSecureContext)throw Error('Notifications require HTTPS.');if(!supported)throw Error('Notifications are not supported by this browser.');if(!push.dataset.vapidKey)throw Error('The server has no VAPID public key configured.');if(Notification.permission==='denied')throw Error('Permission blocked in browser settings.');const permission=Notification.permission==='granted'?'granted':await Notification.requestPermission();if(permission!=='granted')throw Error(permission==='denied'?'Permission blocked in browser settings.':'Notification permission was not granted.');const registration=await reg();let subscription=await registration.pushManager.getSubscription();if(!subscription)subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64(push.dataset.vapidKey)});const response=await fetch('/api/push/subscribe/',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':csrf()},body:JSON.stringify(subscription)});if(!response.ok)throw Error('The server could not save this notification subscription.');await refresh()}catch(error){state(`Could not enable notifications: ${error.message}`,'error',true,false)}};
+  disable.onclick=async()=>{disable.disabled=true;try{const registration=await reg(),subscription=await registration.pushManager.getSubscription();if(subscription){const response=await fetch('/api/push/unsubscribe/',{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':csrf()},body:JSON.stringify({endpoint:subscription.endpoint})});if(!response.ok)throw Error('The server could not disable this device.');await subscription.unsubscribe()}await refresh()}catch(error){state(`Could not disable notifications: ${error.message}`,'error',false,true)}};
+  refresh();
+}
+ if(document.body.dataset.authenticated==='1'&&'WebSocket'in window){const proto=location.protocol==='https:'?'wss':'ws',socket=new WebSocket(`${proto}://${location.host}/ws/league/`);socket.onmessage=e=>{const d=JSON.parse(e.data);if(d.event==='submission_added'){document.querySelectorAll('[data-live-submissions]').forEach(x=>x.textContent=d.submissions);toast('A new song was submitted')}if(d.event==='vote_saved'){document.querySelectorAll('[data-live-votes]').forEach(x=>x.textContent=d.votes)}if(['round_updated','round_deleted'].includes(d.event)){toast('The round changed — refreshing');setTimeout(()=>location.reload(),900)}}}
+ if('serviceWorker'in navigator)navigator.serviceWorker.register('/service-worker.js').catch(()=>{});
+});
+
+
+// Pull to refresh is intentionally limited to installed standalone PWAs.
+(() => {
+ const standalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+ if (!standalone) return;
+ const indicator = document.getElementById('pull-refresh-indicator');
+ if (!indicator) return;
+ const threshold = 88;
+ let startY = 0, distance = 0, tracking = false;
+ const reset = () => {
+  indicator.classList.remove('ready', 'refreshing', 'visible');
+  indicator.textContent = 'Pull to refresh';
+  indicator.setAttribute('aria-hidden', 'true');
+  distance = 0;
+ };
+ document.addEventListener('touchstart', event => {
+  if (window.scrollY > 0 || event.touches.length !== 1) { tracking = false; return; }
+  startY = event.touches[0].clientY;
+  distance = 0;
+  tracking = true;
+ }, {passive:true});
+ document.addEventListener('touchmove', event => {
+  if (!tracking || window.scrollY > 0 || event.touches.length !== 1) return;
+  distance = Math.max(0, event.touches[0].clientY - startY);
+  if (distance < 8) return;
+  indicator.classList.add('visible');
+  indicator.setAttribute('aria-hidden', 'false');
+  indicator.classList.toggle('ready', distance >= threshold);
+  indicator.textContent = distance >= threshold ? 'Release to refresh' : 'Pull to refresh';
+  const offset = Math.min(18 + distance * .28, 52);
+  indicator.style.setProperty('--pull-offset', `${offset}px`);
+ }, {passive:true});
+ document.addEventListener('touchend', () => {
+  if (!tracking) return;
+  tracking = false;
+  if (distance >= threshold) {
+   indicator.classList.remove('ready');
+   indicator.classList.add('refreshing', 'visible');
+   indicator.textContent = 'Refreshing…';
+   indicator.setAttribute('aria-hidden', 'false');
+   window.location.reload();
+   return;
+  }
+  reset();
+ }, {passive:true});
+ document.addEventListener('touchcancel', reset, {passive:true});
+})();
+
+// QueueUp v6.0 in-app confirmation and season welcome.
+document.addEventListener('DOMContentLoaded',()=>{
+ const modal=document.querySelector('[data-song-confirm]');
+ if(modal){let pending=null;const close=()=>{modal.hidden=true;document.body.classList.remove('modal-open');pending=null};document.querySelectorAll('#search-results form').forEach(()=>{});document.addEventListener('submit',event=>{const form=event.target;if(!form.matches('.track form')||form.dataset.confirmed==='1'||form.dataset.explicit==='1')return;event.preventDefault();pending=form;const track=form.closest('.track');modal.querySelector('[data-confirm-track]').textContent=track?.querySelector('strong')?.textContent||'This song';modal.querySelector('[data-confirm-artist]').textContent=track?.querySelector('span')?.textContent||'';modal.hidden=false;document.body.classList.add('modal-open');modal.querySelector('[data-modal-confirm]').focus()});modal.querySelectorAll('[data-modal-cancel]').forEach(button=>button.addEventListener('click',close));modal.querySelector('[data-modal-confirm]').addEventListener('click',()=>{if(!pending)return;pending.dataset.confirmed='1';pending.submit()});}
+ const welcome=document.querySelector('[data-season-welcome]');
+ if(welcome){document.body.classList.add('modal-open');welcome.querySelector('[data-season-enter]').addEventListener('click',async()=>{try{await fetch(welcome.dataset.seenUrl,{method:'POST',headers:{'X-CSRFToken':document.cookie.match(/csrftoken=([^;]+)/)?.[1]||''}})}catch(_){}welcome.remove();document.body.classList.remove('modal-open')});}
+});
+
+
+// QueueUp v7.0 onboarding, clean-music enforcement, and guide acknowledgements.
+document.addEventListener('DOMContentLoaded',()=>{
+ const csrf=()=>decodeURIComponent(document.cookie.match(/(?:^|;\s*)queueup_csrftoken_v2=([^;]+)/)?.[1]||'');
+ const openModal=modal=>{modal.hidden=false;document.body.classList.add('modal-open')};
+ const closeModal=modal=>{modal.hidden=true;document.body.classList.remove('modal-open')};
+ const explicitModal=document.querySelector('[data-explicit-warning]');
+ if(explicitModal){
+  document.addEventListener('click',event=>{if(event.target.closest('.explicit-choice'))openModal(explicitModal)});
+  explicitModal.querySelectorAll('[data-explicit-close]').forEach(button=>button.addEventListener('click',()=>closeModal(explicitModal)));
+ }
+ const rules=document.querySelector('[data-submission-rules]');
+ if(rules){
+  document.body.classList.add('modal-open');
+  const checkbox=rules.querySelector('[data-rules-checkbox]'),button=rules.querySelector('[data-rules-continue]');
+  checkbox.addEventListener('change',()=>button.disabled=!checkbox.checked);
+  button.addEventListener('click',async()=>{
+   if(!checkbox.checked)return;
+   button.disabled=true;button.textContent='Saving…';
+   try{const response=await fetch(rules.dataset.acceptUrl,{method:'POST',headers:{'X-CSRFToken':csrf()}});if(!response.ok)throw Error();rules.remove();document.body.classList.remove('modal-open')}
+   catch(_){button.disabled=false;button.textContent='Try again'}
+  });
+ }
+ const guide=document.querySelector('[data-voting-guide]');
+ if(guide){
+  document.body.classList.add('modal-open');
+  guide.querySelector('[data-guide-continue]').addEventListener('click',async()=>{
+   try{await fetch(guide.dataset.seenUrl,{method:'POST',headers:{'X-CSRFToken':csrf()}})}catch(_){}
+   guide.remove();document.body.classList.remove('modal-open');
+  });
+ }
+});
