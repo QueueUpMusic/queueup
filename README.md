@@ -1,3 +1,5 @@
+<img src="https://github.com/QueueUpMusic/queueup/blob/main/queueup-logo-500-rounded.png" height="200" width="200">
+
 # QueueUp
 
 QueueUp is a self-hosted Django Progressive Web App (PWA) for a private music league.
