@@ -407,6 +407,27 @@ class V70CleanMusicTests(QueueUpTestMixin, TestCase):
         self.assertFalse(Submission.objects.filter(round=self.round, user=self.alice).exists())
 
 
+class SongPickerPreviewTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(hours=1)
+        self.round.submission_deadline = now + timedelta(hours=1)
+        self.round.voting_deadline = now + timedelta(days=2)
+        self.round.reveal_at = now + timedelta(days=3)
+        self.round.save(update_fields=['submission_opens', 'submission_deadline', 'voting_deadline', 'reveal_at'])
+
+    def test_song_picker_shows_preview_button_and_preview_modal(self):
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('song_picker', args=[self.round.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'data-track-preview')
+        self.assertContains(response, 'data-track-preview-modal')
+        self.assertContains(response, 'data-preview-iframe')
+        self.assertContains(response, 'data-song-confirm')
+        self.assertContains(response, '>Choose<')
+
+
 class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
     @staticmethod
     def png_bytes():
