@@ -27,10 +27,6 @@ Players submit one song each round, vote anonymously, and track results, leaderb
 6. Voting closes and results reveal.
 7. Leaderboard/stat updates are applied.
 
-## Screenshots
-
-Screenshots coming soon.
-
 ## Docker installation and deployment
 
 ### 1) Configure environment variables
@@ -51,8 +47,6 @@ Important values include:
 - `PUBLIC_URL`
 - Optional web push settings (`WEBPUSH_*`)
 - Optional `HOST_PORT` override (default is `8080`)
-
-Do not commit real secrets to source control.
 
 ### 2) Start the stack
 

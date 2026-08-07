@@ -1,3 +1,35 @@
+# QueueUp Changelog
+
+## Version order (latest first)
+
+- v7.2.2
+- v7.2.1
+- v7.1.2
+- v7.1.1
+- v7.0.11
+- v7.0.10
+- v7.0.9
+- v7.0.8
+- v7.0.7
+- v7.0.6
+- v7.0.5
+- v7.0.4
+- v7.0.1
+- v7.0
+- v6.0
+- v5.5.5
+- v5.5.2
+- v5.5.1
+- v5.5
+- v5.4.1
+- v5.4
+- v5.2
+- v5.1
+- v5
+- v4
+
+## Historical release notes (preserved)
+
 # QueueUp v7.0.11
 
 Genre Hopper now counts one broad main genre per song and only revealed rounds. Existing Genre Hopper unlock records are reset by migration 0011 so they can be recalculated correctly.
