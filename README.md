@@ -47,8 +47,43 @@ Important values include:
 - PostgreSQL settings (`POSTGRES_*`)
 - Spotify settings (`SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI`)
 - `PUBLIC_URL`
+- SMTP email settings (`EMAIL_*`, `DEFAULT_FROM_EMAIL`) for password resets
 - Optional web push settings (`WEBPUSH_*`)
 - Optional `HOST_PORT` override (default is `8080`)
+
+Password reset emails require an SMTP provider in production. Configure
+`EMAIL_BACKEND`, `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_HOST_USER`,
+`EMAIL_HOST_PASSWORD`, `EMAIL_USE_TLS`, `EMAIL_USE_SSL`, and
+`DEFAULT_FROM_EMAIL` in `.env`, then rebuild/restart the web service. Use
+STARTTLS (`EMAIL_USE_TLS=True`) for providers on port 587 or implicit TLS
+(`EMAIL_USE_SSL=True`) for providers on port 465, but never enable both. QueueUp
+uses Django's console email backend when `EMAIL_BACKEND` is not set, which is
+suitable only for local development.
+
+If SMTP fails with `CERTIFICATE_VERIFY_FAILED`, first verify that `EMAIL_HOST`
+is the provider's documented hostname and that the port/TLS mode above matches
+its instructions. Do not disable certificate verification. For a trusted SMTP
+server or network appliance that intentionally uses a private certificate
+authority, mount the administrator-provided CA certificate into the web
+container and set `EMAIL_CA_FILE` to its in-container path. For example, add the
+following to a local `docker-compose.override.yml` (do not commit the certificate):
+
+```yaml
+services:
+  web:
+    volumes:
+      - ./smtp-ca.crt:/run/secrets/smtp-ca.crt:ro
+```
+
+Then set these values in `.env` and rebuild/restart QueueUp:
+
+```dotenv
+EMAIL_BACKEND=league.email_backend.EmailBackend
+EMAIL_CA_FILE=/run/secrets/smtp-ca.crt
+```
+
+Only trust a CA certificate obtained from the SMTP provider or server
+administrator through a verified channel.
 
 ### 2) Start the stack
 

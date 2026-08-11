@@ -65,3 +65,15 @@ WEBPUSH_PRIVATE_KEY = os.getenv('WEBPUSH_PRIVATE_KEY', '')
 WEBPUSH_CONTACT = os.getenv('WEBPUSH_CONTACT', 'mailto:admin@example.com')
 PUBLIC_URL = os.getenv('PUBLIC_URL', 'http://127.0.0.1:8080').rstrip('/')
 SPOTIFY_REDIRECT_URI = os.getenv('SPOTIFY_REDIRECT_URI', f'{PUBLIC_URL}/control/spotify/callback/')
+
+# Password-reset email delivery. Development defaults to the console backend so
+# a local install never attempts to use credentials that have not been set.
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', '')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True').lower() in {'1', 'true', 'yes', 'on'}
+EMAIL_USE_SSL = os.getenv('EMAIL_USE_SSL', 'False').lower() in {'1', 'true', 'yes', 'on'}
+EMAIL_CA_FILE = os.getenv('EMAIL_CA_FILE', '')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'webmaster@localhost')
