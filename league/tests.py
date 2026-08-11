@@ -9,6 +9,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
+from django.core.mail import get_connection
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.test import TestCase, override_settings
@@ -463,6 +464,23 @@ class PasswordResetTests(TestCase):
         self.client.logout()
         used_response = self.client.get(reset_url, follow=True)
         self.assertContains(used_response, 'invalid, expired, or has already been used')
+
+
+class SMTPEmailBackendTests(TestCase):
+    @override_settings(
+        EMAIL_BACKEND='league.email_backend.EmailBackend',
+        EMAIL_CA_FILE='/run/secrets/smtp-ca.crt',
+    )
+    @patch('django.core.mail.backends.smtp.ssl.create_default_context')
+    def test_private_ca_is_added_to_default_verified_context(self, create_context):
+        context = create_context.return_value
+
+        connection = get_connection()
+        self.assertIs(connection.ssl_context, context)
+
+        context.load_verify_locations.assert_called_once_with(
+            cafile='/run/secrets/smtp-ca.crt',
+        )
 
 
 class V70RoundPrivacyTests(QueueUpTestMixin, TestCase):
