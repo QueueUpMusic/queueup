@@ -47,8 +47,15 @@ Important values include:
 - PostgreSQL settings (`POSTGRES_*`)
 - Spotify settings (`SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REDIRECT_URI`)
 - `PUBLIC_URL`
+- SMTP email settings (`EMAIL_*`, `DEFAULT_FROM_EMAIL`) for password resets
 - Optional web push settings (`WEBPUSH_*`)
 - Optional `HOST_PORT` override (default is `8080`)
+
+Password reset emails require an SMTP provider in production. Configure
+`EMAIL_BACKEND`, `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_HOST_USER`,
+`EMAIL_HOST_PASSWORD`, `EMAIL_USE_TLS`, and `DEFAULT_FROM_EMAIL` in `.env`, then
+rebuild/restart the web service. QueueUp uses Django's console email backend when
+`EMAIL_BACKEND` is not set, which is suitable only for local development.
 
 ### 2) Start the stack
 

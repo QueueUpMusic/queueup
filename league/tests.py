@@ -1,4 +1,5 @@
 import io
+import re
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -6,10 +7,14 @@ from PIL import Image
 
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.contrib.auth.tokens import default_token_generator
+from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 from django.utils import timezone
 
 from .models import NotificationDelivery, PushSubscription, Round, Season, Submission, Vote
@@ -364,6 +369,100 @@ class V70MembershipTests(TestCase):
         player.profile.refresh_from_db()
         self.assertTrue(player.profile.approved)
         self.assertIsNotNone(player.profile.approved_at)
+
+
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class PasswordResetTests(TestCase):
+    email = 'member@example.com'
+    old_password = 'old-password-123'
+    new_password = 'new-password-456'
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            'member', email=self.email, password=self.old_password,
+        )
+
+    def _request_reset(self, email=None):
+        return self.client.post(
+            reverse('password_reset'), {'email': email or self.email}, follow=True,
+        )
+
+    def _reset_url_from_email(self):
+        match = re.search(r'https?://[^\s]+/password-reset/[^\s]+', mail.outbox[0].body)
+        self.assertIsNotNone(match)
+        return match.group(0)
+
+    def test_reset_request_for_existing_user_sends_branded_email(self):
+        response = self._request_reset()
+
+        self.assertRedirects(response, reverse('password_reset_done'))
+        self.assertContains(response, 'If an account exists for that email')
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, 'Reset your QueueUp password')
+        self.assertIn('QueueUp account', mail.outbox[0].body)
+        self.assertIn('/password-reset/', mail.outbox[0].body)
+
+    def test_nonexistent_email_gets_same_generic_response(self):
+        response = self._request_reset('nobody@example.com')
+
+        self.assertRedirects(response, reverse('password_reset_done'))
+        self.assertContains(response, 'If an account exists for that email')
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_valid_reset_token_displays_new_password_form(self):
+        self._request_reset()
+
+        response = self.client.get(self._reset_url_from_email(), follow=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Choose a new password')
+        self.assertContains(response, 'name="new_password1"')
+        self.assertContains(response, 'name="new_password2"')
+
+    def test_invalid_reset_token_cannot_change_password(self):
+        uid = urlsafe_base64_encode(force_bytes(self.user.pk))
+
+        response = self.client.get(reverse(
+            'password_reset_confirm',
+            kwargs={'uidb64': uid, 'token': 'not-a-valid-token'},
+        ))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'invalid, expired, or has already been used')
+        self.assertNotContains(response, 'name="new_password1"')
+
+    @override_settings(PASSWORD_RESET_TIMEOUT=-1)
+    def test_expired_reset_token_cannot_change_password(self):
+        uid = urlsafe_base64_encode(force_bytes(self.user.pk))
+        token = default_token_generator.make_token(self.user)
+
+        response = self.client.get(
+            reverse('password_reset_confirm', kwargs={'uidb64': uid, 'token': token}),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'invalid, expired, or has already been used')
+        self.assertNotContains(response, 'name="new_password1"')
+
+    def test_setting_new_password_invalidates_link_and_allows_login(self):
+        self._request_reset()
+        reset_url = self._reset_url_from_email()
+        form_response = self.client.get(reset_url, follow=True)
+        set_password_url = form_response.request['PATH_INFO']
+
+        response = self.client.post(set_password_url, {
+            'new_password1': self.new_password,
+            'new_password2': self.new_password,
+        }, follow=True)
+
+        self.assertRedirects(response, reverse('password_reset_complete'))
+        self.assertContains(response, 'Password updated')
+        self.assertFalse(self.client.login(username='member', password=self.old_password))
+        self.assertTrue(self.client.login(username='member', password=self.new_password))
+
+        self.client.logout()
+        used_response = self.client.get(reset_url, follow=True)
+        self.assertContains(used_response, 'invalid, expired, or has already been used')
 
 
 class V70RoundPrivacyTests(QueueUpTestMixin, TestCase):
