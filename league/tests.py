@@ -18,7 +18,7 @@ from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from django.utils import timezone
 
-from .models import NotificationDelivery, PushSubscription, Round, Season, Submission, Vote
+from .models import NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
 from .voting import voting_progress
 
@@ -45,6 +45,44 @@ class QueueUpTestMixin:
             round=self.round, user=user, spotify_track_id=track, spotify_uri=f'spotify:track:{track}',
             spotify_url=f'https://open.spotify.com/track/{track}', title=track, artist='Artist',
         )
+
+
+class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.alice)
+
+    def test_new_user_sees_current_season_welcome(self):
+        response = self.client.get(reverse('home'))
+
+        self.assertEqual(response.context['season_welcome'], self.season)
+        self.assertContains(response, 'Enter the season')
+
+    def test_entering_season_creates_welcome_and_hides_prompt(self):
+        response = self.client.post(reverse('season_welcome_seen', args=[self.season.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(SeasonWelcome.objects.filter(user=self.alice, season=self.season).exists())
+        next_page = self.client.get(reverse('leaderboard'))
+        self.assertIsNone(next_page.context['season_welcome'])
+        self.assertNotContains(next_page, 'Enter the season')
+
+    def test_entering_season_is_idempotent(self):
+        url = reverse('season_welcome_seen', args=[self.season.pk])
+
+        self.client.post(url)
+        response = self.client.post(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(SeasonWelcome.objects.filter(user=self.alice, season=self.season).count(), 1)
+
+    def test_existing_welcome_is_unchanged(self):
+        welcome = SeasonWelcome.objects.create(user=self.alice, season=self.season)
+
+        response = self.client.get(reverse('home'))
+
+        self.assertIsNone(response.context['season_welcome'])
+        self.assertEqual(SeasonWelcome.objects.get(user=self.alice, season=self.season), welcome)
 
 
 class VotingTests(QueueUpTestMixin, TestCase):
