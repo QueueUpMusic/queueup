@@ -992,6 +992,80 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
         self.staff = User.objects.create_user('staff-admin', password='x', is_staff=True)
         self.client.force_login(self.staff)
 
+    def round_form_data(self, **overrides):
+        now = timezone.localtime().replace(second=0, microsecond=0)
+        data = {
+            'season': self.season.pk,
+            'prompt': 'A drafted prompt',
+            'details': 'Draft details',
+            'goes_live_at': (now + timedelta(hours=3)).strftime('%Y-%m-%dT%H:%M'),
+            'submission_opens': (now + timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M'),
+            'submission_deadline': (now + timedelta(days=2)).strftime('%Y-%m-%dT%H:%M'),
+            'voting_deadline': (now + timedelta(days=4)).strftime('%Y-%m-%dT%H:%M'),
+            'reveal_at': (now + timedelta(days=5)).strftime('%Y-%m-%dT%H:%M'),
+            'host': '',
+            'playlist_url': '',
+        }
+        data.update(overrides)
+        return data
+
+    def test_round_form_offers_all_three_save_actions(self):
+        response = self.client.get(reverse('round_create'))
+
+        self.assertContains(response, 'value="draft"')
+        self.assertContains(response, 'Save as draft')
+        self.assertContains(response, 'value="save"')
+        self.assertContains(response, 'Save and publish')
+
+    def test_save_as_draft_keeps_round_staff_only_regardless_of_schedule(self):
+        data = self.round_form_data(
+            save_action='draft',
+            goes_live_at=(timezone.localtime() - timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M'),
+        )
+        response = self.client.post(reverse('round_create'), data)
+
+        self.assertRedirects(response, reverse('control_rounds'))
+        drafted = Round.objects.get(prompt='A drafted prompt')
+        self.assertTrue(drafted.is_draft)
+        self.assertEqual(drafted.state, 'draft')
+        self.client.force_login(self.alice)
+        self.assertEqual(self.client.get(reverse('round_detail', args=[drafted.pk])).status_code, 404)
+        self.assertNotEqual(self.client.get(reverse('home')).context['round'], drafted)
+
+    def test_save_activates_draft_but_keeps_scheduled_go_live_time(self):
+        scheduled_live = timezone.now() + timedelta(hours=3)
+        self.round.is_draft = True
+        self.round.save(update_fields=['is_draft'])
+        data = self.round_form_data(
+            prompt=self.round.prompt,
+            save_action='save',
+            goes_live_at=timezone.localtime(scheduled_live).strftime('%Y-%m-%dT%H:%M'),
+        )
+
+        self.client.post(reverse('round_edit', args=[self.round.pk]), data)
+
+        self.round.refresh_from_db()
+        self.assertFalse(self.round.is_draft)
+        self.assertAlmostEqual(self.round.goes_live_at.timestamp(), scheduled_live.replace(second=0, microsecond=0).timestamp(), delta=1)
+        self.assertFalse(self.round.is_visible)
+
+    def test_save_and_publish_activates_draft_and_overrides_go_live_time(self):
+        self.round.is_draft = True
+        self.round.save(update_fields=['is_draft'])
+        before = timezone.now()
+
+        response = self.client.post(
+            reverse('round_edit', args=[self.round.pk]),
+            self.round_form_data(prompt=self.round.prompt, save_action='publish'),
+        )
+
+        self.assertRedirects(response, reverse('control_rounds'))
+        self.round.refresh_from_db()
+        self.assertFalse(self.round.is_draft)
+        self.assertGreaterEqual(self.round.goes_live_at, before - timedelta(seconds=1))
+        self.assertLessEqual(self.round.goes_live_at, timezone.now() + timedelta(seconds=1))
+        self.assertTrue(self.round.is_visible)
+
     def _reveal_round(self):
         now = timezone.now()
         self.round.submission_opens = now - timedelta(days=4)

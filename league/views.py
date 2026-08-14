@@ -81,6 +81,7 @@ def home(request):
     visible = Round.objects.filter(
         models.Q(goes_live_at__isnull=True) | models.Q(goes_live_at__lte=now),
         archived=False,
+        is_draft=False,
     )
 
     # Keep the newest non-revealed round on the homepage, whether it is
@@ -263,9 +264,9 @@ def leaderboard(request):
     players = User.objects.none()
     if selected_season:
         now = timezone.now()
-        revealed_rounds = list(selected_season.rounds.filter(reveal_at__lte=now))
+        revealed_rounds = list(selected_season.rounds.filter(reveal_at__lte=now, is_draft=False))
         counted_vote_ids = counted_vote_ids_for_rounds(revealed_rounds, now=now)
-        season_filter = models.Q(submissions__round__season=selected_season)
+        season_filter = models.Q(submissions__round__season=selected_season, submissions__round__is_draft=False)
         revealed_filter = season_filter & models.Q(submissions__round__reveal_at__lte=now)
         counted_score_filter = revealed_filter & models.Q(submissions__votes__id__in=counted_vote_ids)
         player_rows = list(User.objects.annotate(
@@ -465,7 +466,7 @@ def remove_profile_picture(request):
 @login_required
 def archive(request):
     now = timezone.now()
-    return render(request, 'league/archive.html', {'rounds': Round.objects.filter(reveal_at__lte=now).filter(models.Q(goes_live_at__isnull=True) | models.Q(goes_live_at__lte=now)).order_by('-reveal_at')})
+    return render(request, 'league/archive.html', {'rounds': Round.objects.filter(reveal_at__lte=now, is_draft=False).filter(models.Q(goes_live_at__isnull=True) | models.Q(goes_live_at__lte=now)).order_by('-reveal_at')})
 
 
 @login_required
@@ -658,12 +659,18 @@ def season_create(request):
 
 @staff_required
 def round_create(request):
-    form = RoundForm(request.POST or None)
+    data = request.POST.copy() if request.method == 'POST' else None
+    action = request.POST.get('save_action') if request.method == 'POST' else None
+    if action == 'publish':
+        data['goes_live_at'] = timezone.localtime().strftime('%Y-%m-%dT%H:%M:%S')
+    form = RoundForm(data)
     if request.method == 'POST' and form.is_valid():
-        form.save()
-        messages.success(request, 'Round created.')
+        rnd = form.save(commit=False)
+        rnd.is_draft = action == 'draft'
+        rnd.save()
+        messages.success(request, 'Round saved as a draft.' if rnd.is_draft else ('Round published.' if action == 'publish' else 'Round created.'))
         return redirect('control_rounds')
-    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Create round', 'back_url': reverse('control_rounds')})
+    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Create round', 'back_url': reverse('control_rounds'), 'round_actions': True})
 
 
 @staff_required
@@ -715,9 +722,20 @@ def season_edit(request, pk):
 
 @staff_required
 def round_edit(request, pk):
-    rnd = get_object_or_404(Round, pk=pk); form = RoundForm(request.POST or None, instance=rnd)
-    if request.method == 'POST' and form.is_valid(): form.save(); broadcast('round_updated', round_id=rnd.id, state=rnd.state); messages.success(request, 'Round updated.'); return redirect('control_rounds')
-    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Edit round', 'back_url': reverse('control_rounds')})
+    rnd = get_object_or_404(Round, pk=pk)
+    data = request.POST.copy() if request.method == 'POST' else None
+    action = request.POST.get('save_action') if request.method == 'POST' else None
+    if action == 'publish':
+        data['goes_live_at'] = timezone.localtime().strftime('%Y-%m-%dT%H:%M:%S')
+    form = RoundForm(data, instance=rnd)
+    if request.method == 'POST' and form.is_valid():
+        rnd = form.save(commit=False)
+        rnd.is_draft = action == 'draft'
+        rnd.save()
+        broadcast('round_updated', round_id=rnd.id, state=rnd.state)
+        messages.success(request, 'Round saved as a draft.' if rnd.is_draft else ('Round published.' if action == 'publish' else 'Round updated.'))
+        return redirect('control_rounds')
+    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Edit round', 'back_url': reverse('control_rounds'), 'round_actions': True})
 
 @staff_required
 @require_POST
@@ -804,7 +822,7 @@ def create_playlist(request, pk):
 @login_required
 def live_status(request):
     now = timezone.now()
-    rnd = Round.objects.filter(models.Q(goes_live_at__isnull=True) | models.Q(goes_live_at__lte=now)).first()
+    rnd = Round.objects.filter(models.Q(goes_live_at__isnull=True) | models.Q(goes_live_at__lte=now), is_draft=False).first()
     if not rnd: return JsonResponse({'round': None})
     return JsonResponse({'round': {'id': rnd.id, 'state': rnd.state, 'submissions': rnd.submissions.count(), 'votes': rnd.votes.count()}})
 

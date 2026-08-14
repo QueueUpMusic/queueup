@@ -28,7 +28,7 @@ ACHIEVEMENTS = [
 
 def profile_metrics(user, season=None):
     now = timezone.now()
-    base_subs = user.submissions.select_related('round', 'round__season')
+    base_subs = user.submissions.select_related('round', 'round__season').filter(round__is_draft=False)
     if season:
         base_subs = base_subs.filter(round__season=season)
     related_rounds = list({sub.round_id: sub.round for sub in base_subs}.values())

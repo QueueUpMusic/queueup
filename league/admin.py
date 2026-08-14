@@ -8,8 +8,8 @@ class SeasonAdmin(admin.ModelAdmin):
 
 @admin.register(Round)
 class RoundAdmin(admin.ModelAdmin):
-    list_display = ('prompt', 'season', 'goes_live_at', 'submission_deadline', 'voting_deadline', 'reveal_at')
-    list_filter = ('season',)
+    list_display = ('prompt', 'season', 'is_draft', 'goes_live_at', 'submission_deadline', 'voting_deadline', 'reveal_at')
+    list_filter = ('season', 'is_draft')
 
 @admin.register(Submission)
 class SubmissionAdmin(admin.ModelAdmin):
