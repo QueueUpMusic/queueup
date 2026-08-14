@@ -89,17 +89,20 @@ class Round(models.Model):
     voting_reminder_notification_sent = models.BooleanField(default=False)
     reveal_notification_sent = models.BooleanField(default=False)
     archived = models.BooleanField(default=False, help_text='Hide this completed round from the homepage while keeping it in the archive.')
+    is_draft = models.BooleanField(default=False, help_text='Keep this round staff-only until it is saved or published.')
 
     class Meta:
         ordering = ['-submission_opens']
 
     @property
     def is_visible(self):
-        return not self.goes_live_at or self.goes_live_at <= timezone.now()
+        return not self.is_draft and (not self.goes_live_at or self.goes_live_at <= timezone.now())
 
     @property
     def state(self):
         now = timezone.now()
+        if self.is_draft:
+            return 'draft'
         if not self.is_visible:
             return 'hidden'
         if now < self.submission_opens:
