@@ -109,6 +109,83 @@ class RealtimeAuthorizationTests(QueueUpTestMixin, TransactionTestCase):
         self.assertFalse(self.connection_accepted(self.alice))
 
 
+class ApiFoundationTests(QueueUpTestMixin, TestCase):
+    def test_anonymous_session_returns_json_401(self):
+        response = self.client.get(reverse('api-v1:session'))
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()['error']['code'],
+            'authentication_required',
+        )
+
+    def test_pending_user_can_read_session_but_not_league_api(self):
+        pending = User.objects.create_user('pending-api', password='x')
+        self.client.force_login(pending)
+
+        session_response = self.client.get(reverse('api-v1:session'))
+        api_response = self.client.get(reverse('api-v1:index'))
+
+        self.assertEqual(session_response.status_code, 200)
+        self.assertFalse(session_response.json()['data']['user']['approved'])
+        self.assertEqual(api_response.status_code, 403)
+        self.assertEqual(
+            api_response.json()['error']['code'],
+            'approval_required',
+        )
+
+    def test_approved_session_returns_current_user(self):
+        self.client.force_login(self.alice)
+
+        response = self.client.get(reverse('api-v1:session'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()['data']['user']['username'],
+            self.alice.username,
+        )
+        self.assertTrue(response.json()['data']['user']['approved'])
+
+    def test_staff_session_has_league_access_without_profile_approval(self):
+        staff = User.objects.create_user('api-staff', password='x', is_staff=True)
+        self.client.force_login(staff)
+
+        response = self.client.get(reverse('api-v1:index'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['version'], 'v1')
+
+    def test_api_mutations_require_csrf_and_use_json_error(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+
+        response = client.post(reverse('api-v1:index'))
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error']['code'], 'csrf_failed')
+
+    def test_api_method_errors_use_json_convention_with_valid_csrf(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+        client.get(reverse('api-v1:session'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+
+        response = client.post(
+            reverse('api-v1:index'),
+            HTTP_X_CSRFTOKEN=token,
+        )
+
+        self.assertEqual(response.status_code, 405)
+        self.assertEqual(
+            response.json()['error']['code'],
+            'method_not_allowed',
+        )
+
+
 class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
     def setUp(self):
         super().setUp()
