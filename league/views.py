@@ -31,6 +31,7 @@ from .spotify import api_get, exchange_code, extract_track_id, normalize_track, 
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .services import submissions as submission_service
+from .services import votes as vote_service
 from .push import send_user_push
 from .voting import completed_voter_ids, voting_progress
 
@@ -188,16 +189,18 @@ def submit_song(request, pk):
 def vote(request, pk, submission_id):
     rnd = get_object_or_404(Round, pk=pk)
     sub = get_object_or_404(Submission, pk=submission_id, round=rnd)
-    if rnd.state != 'voting':
+    try:
+        command = vote_service.prepare_vote(rnd, request.user, sub)
+    except vote_service.VotingClosed:
         messages.error(request, 'Voting is not open.')
         return redirect('round_detail', pk=pk)
-    if sub.user_id == request.user.id:
+    except vote_service.SelfVoteNotAllowed:
         messages.error(request, "You can't vote for your own song.")
         return redirect('round_detail', pk=pk)
     form = VoteForm(request.POST)
     if form.is_valid():
-        Vote.objects.update_or_create(round=rnd, voter=request.user, submission=sub, defaults={'score': form.cleaned_data['score']})
-        progress = voting_progress(rnd, request.user)
+        result = command.save(form.cleaned_data['score'])
+        progress = result.progress
         if request.headers.get('x-requested-with') == 'XMLHttpRequest':
             return JsonResponse({
                 'ok': True, 'score': form.cleaned_data['score'],

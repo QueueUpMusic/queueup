@@ -22,6 +22,7 @@ from .models import NotificationDelivery, PushSubscription, Round, Season, Seaso
 from .ranking import competition_rank, ranked_submissions, winner_ids
 from .services.ballots import ballot_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
+from .services import votes as vote_service
 from .voting import voting_progress
 
 
@@ -88,6 +89,33 @@ class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
 
 
 class VotingTests(QueueUpTestMixin, TestCase):
+    @patch('league.views.broadcast')
+    def test_first_rating_creates_one_vote_and_preserves_realtime_event(
+        self, mocked_broadcast,
+    ):
+        self.submission(self.alice, 'own-first-vote')
+        bob_song = self.submission(self.bob, 'bob-first-vote')
+        self.client.force_login(self.alice)
+
+        response = self.client.post(
+            reverse('vote', args=[self.round.pk, bob_song.pk]),
+            {'score': 4},
+        )
+
+        self.assertRedirects(
+            response,
+            reverse('round_detail', args=[self.round.pk]),
+            fetch_redirect_response=False,
+        )
+        votes = Vote.objects.filter(voter=self.alice, submission=bob_song)
+        self.assertEqual(votes.count(), 1)
+        self.assertEqual(votes.get().score, 4)
+        mocked_broadcast.assert_called_once_with(
+            'vote_saved',
+            round_id=self.round.id,
+            votes=1,
+        )
+
     def test_ballot_excludes_voters_own_submission(self):
         own = self.submission(self.alice, 'own-ineligible')
         bob_song = self.submission(self.bob, 'bob-eligible')
@@ -162,6 +190,37 @@ class VotingTests(QueueUpTestMixin, TestCase):
         self.assertTrue(response.json()['complete'])
         self.assertTrue(Vote.objects.filter(voter=self.alice, submission=bob_song, score=5).exists())
 
+    def test_ajax_progress_increments_and_final_vote_completes_ballot(self):
+        self.submission(self.alice, 'own-progress-ajax')
+        bob_song = self.submission(self.bob, 'bob-progress-ajax')
+        cara_song = self.submission(self.cara, 'cara-progress-ajax')
+        self.client.force_login(self.alice)
+
+        partial = self.client.post(
+            reverse('vote', args=[self.round.pk, bob_song.pk]),
+            {'score': 3},
+            HTTP_X_REQUESTED_WITH='XMLHttpRequest',
+        )
+
+        self.assertEqual(partial.status_code, 200)
+        self.assertEqual(partial.json()['voted_count'], 1)
+        self.assertEqual(partial.json()['eligible_count'], 2)
+        self.assertFalse(partial.json()['complete'])
+
+        complete = self.client.post(
+            reverse('vote', args=[self.round.pk, cara_song.pk]),
+            {'score': 5},
+            HTTP_X_REQUESTED_WITH='XMLHttpRequest',
+        )
+
+        self.assertEqual(complete.status_code, 200)
+        self.assertEqual(complete.json()['voted_count'], 2)
+        self.assertEqual(complete.json()['eligible_count'], 2)
+        self.assertTrue(complete.json()['complete'])
+        revisit = self.client.get(reverse('round_detail', args=[self.round.pk]))
+        self.assertTrue(revisit.context['voting_complete'])
+        self.assertContains(revisit, "You're all caught up!")
+
     def test_review_page_loads_previously_saved_scores(self):
         self.submission(self.alice, 'own-review')
         bob_song = self.submission(self.bob, 'bob-review')
@@ -184,7 +243,9 @@ class VotingTests(QueueUpTestMixin, TestCase):
         self.submission(self.alice, 'own-edit')
         bob_song = self.submission(self.bob, 'bob-edit')
         cara_song = self.submission(self.cara, 'cara-edit')
-        Vote.objects.create(round=self.round, voter=self.alice, submission=bob_song, score=2)
+        bob_vote = Vote.objects.create(
+            round=self.round, voter=self.alice, submission=bob_song, score=2,
+        )
         Vote.objects.create(round=self.round, voter=self.alice, submission=cara_song, score=5)
 
         self.client.force_login(self.alice)
@@ -195,8 +256,58 @@ class VotingTests(QueueUpTestMixin, TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(Vote.objects.get(voter=self.alice, submission=bob_song).score, 4)
+        updated = Vote.objects.get(voter=self.alice, submission=bob_song)
+        self.assertEqual(updated.pk, bob_vote.pk)
+        self.assertEqual(updated.score, 4)
         self.assertEqual(Vote.objects.get(voter=self.alice, submission=cara_song).score, 5)
+        self.assertEqual(Vote.objects.filter(voter=self.alice).count(), 2)
+
+    @patch('league.views.broadcast')
+    def test_invalid_score_is_rejected_without_mutation_or_broadcast(
+        self, mocked_broadcast,
+    ):
+        bob_song = self.submission(self.bob, 'bob-invalid-score')
+        self.client.force_login(self.alice)
+
+        response = self.client.post(
+            reverse('vote', args=[self.round.pk, bob_song.pk]),
+            {'score': 6},
+        )
+
+        self.assertRedirects(
+            response,
+            reverse('round_detail', args=[self.round.pk]),
+            fetch_redirect_response=False,
+        )
+        self.assertFalse(
+            Vote.objects.filter(voter=self.alice, submission=bob_song).exists()
+        )
+        mocked_broadcast.assert_not_called()
+        with self.assertRaises(vote_service.InvalidVoteScore):
+            vote_service.record_vote(self.round, self.alice, bob_song, 6)
+
+    @patch('league.views.broadcast')
+    def test_voting_outside_permitted_phase_is_rejected(
+        self, mocked_broadcast,
+    ):
+        bob_song = self.submission(self.bob, 'bob-closed-voting')
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+        self.client.force_login(self.alice)
+
+        response = self.client.post(
+            reverse('vote', args=[self.round.pk, bob_song.pk]),
+            {'score': 4},
+            follow=True,
+        )
+
+        self.assertContains(response, 'Voting is not open.')
+        self.assertFalse(
+            Vote.objects.filter(voter=self.alice, submission=bob_song).exists()
+        )
+        mocked_broadcast.assert_not_called()
 
     def test_changed_rating_keeps_completion(self):
         self.submission(self.alice, 'own')
@@ -206,6 +317,11 @@ class VotingTests(QueueUpTestMixin, TestCase):
         response = self.client.post(reverse('vote', args=[self.round.pk, bob_song.pk]), {'score': 4}, HTTP_X_REQUESTED_WITH='XMLHttpRequest')
         self.assertTrue(response.json()['complete'])
         self.assertEqual(Vote.objects.get(voter=self.alice, submission=bob_song).score, 4)
+        review = self.client.get(
+            reverse('round_detail', args=[self.round.pk]) + '?review=1'
+        )
+        self.assertEqual(review.context['vote_scores'][bob_song.id], 4)
+        self.assertContains(review, 'name="score" value="4"', count=1)
 
 
 class RankingTests(QueueUpTestMixin, TestCase):
