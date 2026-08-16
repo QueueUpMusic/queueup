@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import player_views, submission_views, views
+from . import player_views, submission_views, views, voting_views
 
 
 app_name = 'api-v1'
@@ -18,6 +18,11 @@ urlpatterns = [
     path('spotify/search/', submission_views.spotify_search, name='spotify-search'),
     path('rounds/<int:pk>/submission/', submission_views.submission_status, name='submission-status'),
     path('rounds/<int:pk>/submissions/', submission_views.create_submission, name='submission-create'),
+    path(
+        'rounds/<int:pk>/votes/<int:submission_id>/',
+        voting_views.save_vote,
+        name='vote-save',
+    ),
     path('profiles/<str:username>/', player_views.profile, name='profile'),
     path(
         'profiles/<str:username>/achievements/',

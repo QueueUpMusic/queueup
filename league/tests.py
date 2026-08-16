@@ -557,6 +557,122 @@ class SubmissionApiTests(QueueUpTestMixin, TestCase):
         self.assertFalse(status['can_submit'])
 
 
+class VotingApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.own = self.submission(self.alice, 'api-vote-own')
+        self.bob_song = self.submission(self.bob, 'api-vote-bob')
+        self.cara_song = self.submission(self.cara, 'api-vote-cara')
+        self.client.force_login(self.alice)
+
+    def vote_url(self, submission):
+        return reverse(
+            'api-v1:vote-save', args=[self.round.pk, submission.pk],
+        )
+
+    @patch('league.api.voting_views.broadcast')
+    def test_incremental_vote_create_edit_and_realtime_parity(
+        self, mocked_broadcast,
+    ):
+        first = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 2}),
+            content_type='application/json',
+        )
+        vote = Vote.objects.get(voter=self.alice, submission=self.bob_song)
+        second = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 5}),
+            content_type='application/json',
+        )
+
+        vote.refresh_from_db()
+        self.assertEqual(Vote.objects.filter(
+            voter=self.alice, submission=self.bob_song,
+        ).count(), 1)
+        self.assertEqual(vote.score, 5)
+        self.assertTrue(first.json()['data']['vote']['created'])
+        self.assertFalse(second.json()['data']['vote']['created'])
+        self.assertEqual(second.json()['data']['vote']['id'], vote.pk)
+        self.assertEqual(mocked_broadcast.call_count, 2)
+        mocked_broadcast.assert_called_with(
+            'vote_saved', round_id=self.round.pk, votes=1,
+        )
+
+    def test_editing_one_rating_preserves_other_saved_ratings(self):
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=self.bob_song, score=2,
+        )
+        other = Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=self.cara_song, score=4,
+        )
+
+        response = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 5}),
+            content_type='application/json',
+        )
+
+        other.refresh_from_db()
+        saved = response.json()['data']['ballot']['saved_scores']
+        self.assertEqual(other.score, 4)
+        self.assertEqual(saved[str(self.bob_song.pk)], 5)
+        self.assertEqual(saved[str(self.cara_song.pk)], 4)
+        self.assertTrue(response.json()['data']['ballot']['complete'])
+
+    def test_self_vote_and_invalid_scores_are_rejected(self):
+        self_vote = self.client.post(
+            self.vote_url(self.own),
+            data=json.dumps({'score': 5}),
+            content_type='application/json',
+        )
+        invalid = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 6}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(self_vote.json()['error']['code'], 'self_vote')
+        self.assertEqual(invalid.json()['error']['code'], 'invalid_score')
+        self.assertFalse(Vote.objects.filter(voter=self.alice).exists())
+
+    def test_voting_phase_is_validated_server_side(self):
+        self.round.voting_deadline = timezone.now() - timedelta(minutes=1)
+        self.round.save(update_fields=['voting_deadline'])
+
+        response = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 4}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.json()['error']['code'], 'voting_closed')
+        self.assertFalse(Vote.objects.filter(voter=self.alice).exists())
+
+    def test_final_vote_marks_complete_and_ballot_read_returns_saved_scores(self):
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=self.bob_song, score=3,
+        )
+
+        mutation = self.client.post(
+            self.vote_url(self.cara_song),
+            data=json.dumps({'score': 4}),
+            content_type='application/json',
+        ).json()['data']
+        ballot = self.client.get(reverse(
+            'api-v1:ballot', args=[self.round.pk],
+        )).json()['data']
+
+        self.assertTrue(mutation['ballot']['complete'])
+        self.assertEqual(mutation['ballot']['voted_count'], 2)
+        self.assertTrue(ballot['complete'])
+        self.assertEqual(ballot['saved_scores'][str(self.bob_song.pk)], 3)
+        self.assertEqual(ballot['saved_scores'][str(self.cara_song.pk)], 4)
+
+
 class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
     def setUp(self):
         super().setUp()
