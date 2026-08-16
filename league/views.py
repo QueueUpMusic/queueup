@@ -25,9 +25,10 @@ from .forms import BadgeForm, ProfileForm, ProfilePictureForm, RoundForm, Season
 from .services.achievements import earned_badges, prestige_badges
 from .realtime import broadcast
 from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserProfile, Vote
-from .spotify import api_get, exchange_code, extract_track_id, normalize_track, spotify_authorize_url, user_api
+from .spotify import exchange_code, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
+from .services.spotify_search import search_tracks
 from .services.profiles import profile_for_user
 from .services import rounds as round_service
 from .services import round_status as round_status_service
@@ -124,26 +125,13 @@ def song_picker(request, pk):
 def spotify_search(request):
     q = request.GET.get('q', '').strip()
     round_id = request.GET.get('round')
-    if len(q) < 2:
-        return JsonResponse({'tracks': []})
-    used_track_ids = set()
-    used_isrcs = set()
+    search_round = None
     if round_id:
         search_round = Round.objects.filter(pk=round_id).first()
-        if search_round and (search_round.is_visible or request.user.is_staff):
-            round_submissions = Submission.objects.filter(round_id=round_id)
-            used_track_ids = set(round_submissions.values_list('spotify_track_id', flat=True))
-            used_isrcs = {value for value in round_submissions.values_list('isrc', flat=True) if value}
+        if search_round and not (search_round.is_visible or request.user.is_staff):
+            search_round = None
     try:
-        pasted_id = extract_track_id(q)
-        if pasted_id:
-            tracks = [normalize_track(api_get(f'/tracks/{pasted_id}'))]
-        else:
-            result = api_get('/search', {'q': q, 'type': 'track', 'limit': 10})
-            tracks = [normalize_track(t) for t in result['tracks']['items']]
-        for track in tracks:
-            track['used'] = track['id'] in used_track_ids or bool(track.get('isrc') and track['isrc'] in used_isrcs)
-        return JsonResponse({'tracks': tracks})
+        return JsonResponse({'tracks': search_tracks(q, search_round)})
     except Exception as exc:
         return JsonResponse({'tracks': [], 'error': str(exc)}, status=502)
 
