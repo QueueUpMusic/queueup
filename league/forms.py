@@ -3,6 +3,7 @@ from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
 
 from .models import Badge, Round, Season, UserProfile, Vote
+from .services.media import validate_profile_picture
 
 
 class SignupForm(UserCreationForm):
@@ -91,14 +92,7 @@ class ProfilePictureForm(forms.Form):
     )
 
     def clean_picture(self):
-        picture = self.cleaned_data['picture']
-        if picture.size > 5 * 1024 * 1024:
-            raise forms.ValidationError('Please choose an image smaller than 5 MB.')
-
-        image_format = getattr(getattr(picture, 'image', None), 'format', '').upper()
-        if image_format not in {'JPEG', 'PNG', 'GIF', 'WEBP'}:
-            raise forms.ValidationError('Please choose a JPG/JPEG, HEIC/HEIF, PNG, GIF, or WebP image.')
-        return picture
+        return validate_profile_picture(self.cleaned_data['picture'])
 
 
 class BadgeForm(forms.ModelForm):

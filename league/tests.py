@@ -1297,6 +1297,13 @@ class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
         self.assertIn(settings.CSRF_COOKIE_NAME, response.cookies)
         self.assertIn('no-cache', response.headers.get('Cache-Control', ''))
 
+    def test_csrf_exemption_is_isolated_to_picture_upload_endpoint(self):
+        from .views import profile_edit, remove_profile_picture, upload_profile_picture
+
+        self.assertTrue(upload_profile_picture.csrf_exempt)
+        self.assertFalse(getattr(profile_edit, 'csrf_exempt', False))
+        self.assertFalse(getattr(remove_profile_picture, 'csrf_exempt', False))
+
     def test_profile_edit_remains_csrf_protected(self):
         from django.test import Client
         client = Client(enforce_csrf_checks=True)
@@ -1436,12 +1443,80 @@ class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
         self.alice.profile.refresh_from_db()
         self.assertFalse(bool(self.alice.profile.picture))
 
+    def test_replacing_picture_deletes_old_stored_file(self):
+        self.client.force_login(self.alice)
+        first = SimpleUploadedFile(
+            'first-profile-picture.png',
+            self.png_bytes(),
+            content_type='image/png',
+        )
+        self.client.post(
+            reverse('profile_picture_upload'),
+            {'picture': first},
+        )
+        self.alice.profile.refresh_from_db()
+        old_name = self.alice.profile.picture.name
+        storage = self.alice.profile.picture.storage
+        self.assertTrue(storage.exists(old_name))
+
+        second = SimpleUploadedFile(
+            'replacement-profile-picture.jpg',
+            self.jpeg_bytes(),
+            content_type='image/jpeg',
+        )
+        response = self.client.post(
+            reverse('profile_picture_upload'),
+            {'picture': second},
+        )
+
+        self.assertRedirects(response, reverse('profile_edit'))
+        self.alice.profile.refresh_from_db()
+        new_name = self.alice.profile.picture.name
+        self.assertNotEqual(new_name, old_name)
+        self.assertFalse(storage.exists(old_name))
+        self.assertTrue(storage.exists(new_name))
+        self.alice.profile.picture.delete(save=False)
+
+    def test_invalid_picture_does_not_replace_current_stored_file(self):
+        self.client.force_login(self.alice)
+        current = SimpleUploadedFile(
+            'current-profile-picture.png',
+            self.png_bytes(),
+            content_type='image/png',
+        )
+        self.client.post(
+            reverse('profile_picture_upload'),
+            {'picture': current},
+        )
+        self.alice.profile.refresh_from_db()
+        current_name = self.alice.profile.picture.name
+        storage = self.alice.profile.picture.storage
+
+        invalid = SimpleUploadedFile(
+            'invalid-replacement.txt',
+            b'not an image',
+            content_type='text/plain',
+        )
+        response = self.client.post(
+            reverse('profile_picture_upload'),
+            {'picture': invalid},
+        )
+
+        self.assertRedirects(response, reverse('profile_edit'))
+        self.alice.profile.refresh_from_db()
+        self.assertEqual(self.alice.profile.picture.name, current_name)
+        self.assertTrue(storage.exists(current_name))
+        self.alice.profile.picture.delete(save=False)
+
 
     def test_remove_picture_is_in_picture_card_and_remains_csrf_protected(self):
         from django.test import Client
         picture = SimpleUploadedFile('avatar.png', self.png_bytes(), content_type='image/png')
         self.alice.profile.picture = picture
         self.alice.profile.save(update_fields=['picture', 'updated_at'])
+        stored_name = self.alice.profile.picture.name
+        storage = self.alice.profile.picture.storage
+        self.assertTrue(storage.exists(stored_name))
 
         client = Client(enforce_csrf_checks=True)
         self.assertTrue(client.login(username='alice', password='x'))
@@ -1464,6 +1539,7 @@ class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
         self.assertRedirects(removed, reverse('profile_edit'))
         self.alice.profile.refresh_from_db()
         self.assertFalse(bool(self.alice.profile.picture))
+        self.assertFalse(storage.exists(stored_name))
 
 class RoundStatusTests(QueueUpTestMixin, TestCase):
     def setUp(self):

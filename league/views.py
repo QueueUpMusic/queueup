@@ -12,7 +12,6 @@ from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.auth.models import User
 from django.db import models
-from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.models import Avg, Count
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
@@ -34,6 +33,7 @@ from .services import rounds as round_service
 from .services import round_status as round_status_service
 from .services import badges as badge_service
 from .services import membership as membership_service
+from .services import media as media_service
 from .services import submissions as submission_service
 from .services import votes as vote_service
 from .push import send_user_push
@@ -284,63 +284,6 @@ def profile_edit(request):
     return render(request, 'league/profile_edit.html', {'form': form})
 
 
-PROFILE_PICTURE_MAX_BYTES = 5 * 1024 * 1024
-PROFILE_PICTURE_FORMATS = {
-    'JPEG': ('image/jpeg', '.jpg'),
-    'PNG': ('image/png', '.png'),
-    'GIF': ('image/gif', '.gif'),
-    'WEBP': ('image/webp', '.webp'),
-}
-
-
-def _normalize_picture_bytes(filename, content_type, picture_bytes):
-    """Identify the real image format and convert Apple HEIC/HEIF to JPEG."""
-    from PIL import Image, ImageOps, UnidentifiedImageError
-
-    try:
-        from pillow_heif import register_heif_opener
-        register_heif_opener()
-    except ImportError:
-        pass
-
-    try:
-        with Image.open(io.BytesIO(picture_bytes)) as image:
-            image_format = (image.format or '').upper()
-            image.load()
-
-            if image_format in {'HEIC', 'HEIF'}:
-                image = ImageOps.exif_transpose(image)
-                image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-                if image.mode not in {'RGB', 'L'}:
-                    if 'A' in image.getbands():
-                        background = Image.new('RGB', image.size, 'white')
-                        alpha = image.getchannel('A')
-                        background.paste(image.convert('RGB'), mask=alpha)
-                        image = background
-                    else:
-                        image = image.convert('RGB')
-                elif image.mode == 'L':
-                    image = image.convert('RGB')
-
-                for quality in (90, 82, 74, 66):
-                    output = io.BytesIO()
-                    image.save(output, format='JPEG', quality=quality, optimize=True)
-                    picture_bytes = output.getvalue()
-                    if len(picture_bytes) <= PROFILE_PICTURE_MAX_BYTES:
-                        break
-                image_format = 'JPEG'
-    except (UnidentifiedImageError, OSError, ValueError):
-        return filename, content_type, picture_bytes
-
-    normalized = PROFILE_PICTURE_FORMATS.get(image_format)
-    if not normalized:
-        return filename, content_type, picture_bytes
-
-    normalized_type, normalized_extension = normalized
-    base_name = filename.rsplit('.', 1)[0] if '.' in filename else filename
-    return f'{base_name}{normalized_extension}', normalized_type, picture_bytes
-
-
 def _picture_upload_error(request, message, raw_upload=False):
     if raw_upload:
         return JsonResponse({'ok': False, 'error': str(message)}, status=400)
@@ -359,39 +302,36 @@ def upload_profile_picture(request):
             content_length = int(request.headers.get('Content-Length') or 0)
         except (TypeError, ValueError):
             content_length = 0
-        if content_length > PROFILE_PICTURE_MAX_BYTES:
+        if content_length > media_service.PROFILE_PICTURE_MAX_BYTES:
             return _picture_upload_error(request, 'Please choose an image smaller than 5 MB.', True)
 
-        picture_bytes = request.read(PROFILE_PICTURE_MAX_BYTES + 1)
+        picture_bytes = request.read(media_service.PROFILE_PICTURE_MAX_BYTES + 1)
         if not picture_bytes:
             return _picture_upload_error(request, 'The selected image was empty. Please choose it again.', True)
-        if len(picture_bytes) > PROFILE_PICTURE_MAX_BYTES:
+        if len(picture_bytes) > media_service.PROFILE_PICTURE_MAX_BYTES:
             return _picture_upload_error(request, 'Please choose an image smaller than 5 MB.', True)
 
         encoded_name = request.headers.get('X-QueueUp-Filename', 'profile-picture')
         filename = unquote(encoded_name).replace('\\', '/').rsplit('/', 1)[-1].strip() or 'profile-picture'
         content_type = request.content_type or 'application/octet-stream'
-        filename, content_type, picture_bytes = _normalize_picture_bytes(filename, content_type, picture_bytes)
-        if '.' not in filename:
-            extension = {
-                'image/jpeg': '.jpg', 'image/jpg': '.jpg', 'image/pjpeg': '.jpg',
-                'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp',
-            }.get(content_type.lower(), '')
-            filename += extension
-        picture = SimpleUploadedFile(filename, picture_bytes, content_type=content_type)
+        picture = media_service.uploaded_profile_picture(
+            filename,
+            content_type,
+            picture_bytes,
+            add_content_type_extension=True,
+        )
         form = ProfilePictureForm(files={'picture': picture})
     else:
         picture = request.FILES.get('picture')
         if picture is None and request.FILES:
             picture = next(iter(request.FILES.values()))
-        if picture is not None and picture.size <= PROFILE_PICTURE_MAX_BYTES:
-            picture_bytes = picture.read(PROFILE_PICTURE_MAX_BYTES + 1)
-            filename, content_type, picture_bytes = _normalize_picture_bytes(
+        if picture is not None and picture.size <= media_service.PROFILE_PICTURE_MAX_BYTES:
+            picture_bytes = picture.read(media_service.PROFILE_PICTURE_MAX_BYTES + 1)
+            picture = media_service.uploaded_profile_picture(
                 picture.name,
                 picture.content_type or 'application/octet-stream',
                 picture_bytes,
             )
-            picture = SimpleUploadedFile(filename, picture_bytes, content_type=content_type)
         files = {'picture': picture} if picture is not None else {}
         form = ProfilePictureForm(request.POST, files)
 
@@ -399,12 +339,10 @@ def upload_profile_picture(request):
         error = next(iter(form.errors.values()))[0]
         return _picture_upload_error(request, error, raw_upload)
 
-    profile, _ = UserProfile.objects.get_or_create(user=request.user)
-    old_picture = profile.picture
-    profile.picture = form.cleaned_data['picture']
-    profile.save(update_fields=['picture', 'updated_at'])
-    if old_picture and old_picture.name != profile.picture.name:
-        old_picture.delete(save=False)
+    media_service.replace_profile_picture(
+        request.user,
+        form.cleaned_data['picture'],
+    )
     messages.success(request, 'Your profile picture has been updated.')
     if raw_upload:
         return JsonResponse({'ok': True, 'redirect': reverse('profile_edit')})
@@ -414,11 +352,7 @@ def upload_profile_picture(request):
 @login_required
 @require_POST
 def remove_profile_picture(request):
-    profile, _ = UserProfile.objects.get_or_create(user=request.user)
-    if profile.picture:
-        profile.picture.delete(save=False)
-        profile.picture = ''
-        profile.save(update_fields=['picture', 'updated_at'])
+    if media_service.remove_profile_picture(request.user):
         messages.success(request, 'Your profile picture has been removed.')
     return redirect('profile_edit')
 
