@@ -1,4 +1,5 @@
 import io
+import json
 import re
 from datetime import timedelta
 from unittest.mock import patch
@@ -183,6 +184,216 @@ class ApiFoundationTests(QueueUpTestMixin, TestCase):
         self.assertEqual(
             response.json()['error']['code'],
             'method_not_allowed',
+        )
+
+
+class PlayerReadApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.alice)
+
+    def test_dashboard_matches_html_round_selection_and_order(self):
+        now = timezone.now()
+        previous = Round.objects.create(
+            season=self.season,
+            prompt='Previous result',
+            submission_opens=now - timedelta(days=5),
+            submission_deadline=now - timedelta(days=4),
+            voting_deadline=now - timedelta(days=3),
+            reveal_at=now - timedelta(days=2),
+        )
+        self.round.submission_opens = now + timedelta(days=1)
+        self.round.submission_deadline = now + timedelta(days=2)
+        self.round.voting_deadline = now + timedelta(days=3)
+        self.round.reveal_at = now + timedelta(days=4)
+        self.round.save()
+
+        html = self.client.get(reverse('home'))
+        api = self.client.get(reverse('api-v1:dashboard')).json()['data']
+
+        self.assertEqual(html.context['round'].pk, self.round.pk)
+        self.assertEqual(html.context['results_round'].pk, previous.pk)
+        self.assertEqual(
+            [(card['kind'], card['round']['id']) for card in api['cards']],
+            [('results', previous.pk), ('current', self.round.pk)],
+        )
+
+    def test_hidden_and_draft_rounds_are_not_available_to_players(self):
+        self.round.goes_live_at = timezone.now() + timedelta(days=1)
+        self.round.save(update_fields=['goes_live_at'])
+        draft = Round.objects.create(
+            season=self.season,
+            prompt='Private draft',
+            submission_opens=timezone.now() - timedelta(days=1),
+            submission_deadline=timezone.now() + timedelta(days=1),
+            voting_deadline=timezone.now() + timedelta(days=2),
+            reveal_at=timezone.now() + timedelta(days=3),
+            is_draft=True,
+        )
+
+        hidden_response = self.client.get(reverse(
+            'api-v1:round-detail', args=[self.round.pk],
+        ))
+        draft_response = self.client.get(reverse(
+            'api-v1:round-detail', args=[draft.pk],
+        ))
+
+        self.assertEqual(hidden_response.status_code, 404)
+        self.assertEqual(draft_response.status_code, 404)
+
+    def test_pre_reveal_round_and_ballot_do_not_leak_ownership_or_results(self):
+        self.bob.first_name = 'Private Submitter Identity'
+        self.bob.save(update_fields=['first_name'])
+        own = self.submission(self.alice, 'track-one')
+        other = self.submission(self.bob, 'track-two')
+        Vote.objects.create(
+            round=self.round,
+            voter=self.alice,
+            submission=other,
+            score=4,
+        )
+
+        response = self.client.get(reverse(
+            'api-v1:round-detail', args=[self.round.pk],
+        ))
+        data = response.json()['data']
+        serialized = json.dumps(data)
+
+        self.assertEqual(data['my_submission']['id'], own.pk)
+        self.assertEqual(
+            data['ballot']['saved_scores'][str(other.pk)], 4,
+        )
+        self.assertNotIn('results', data)
+        self.assertNotIn('Private Submitter Identity', serialized)
+        self.assertNotIn(self.bob.username, serialized)
+        eligible = data['ballot']['eligible_submissions'][0]
+        self.assertNotIn('submitter', eligible)
+        self.assertNotIn('user_id', eligible)
+        self.assertNotIn('average_score', eligible)
+        self.assertNotIn('place', eligible)
+
+    def test_results_are_unavailable_until_reveal_then_match_html(self):
+        alice_song = self.submission(self.alice, 'result-one')
+        bob_song = self.submission(self.bob, 'result-two')
+        Vote.objects.create(
+            round=self.round, voter=self.cara,
+            submission=alice_song, score=4,
+        )
+        Vote.objects.create(
+            round=self.round, voter=self.cara,
+            submission=bob_song, score=5,
+        )
+        results_url = reverse('api-v1:results', args=[self.round.pk])
+
+        self.assertEqual(self.client.get(results_url).status_code, 404)
+
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+        html = self.client.get(reverse('round_detail', args=[self.round.pk]))
+        api = self.client.get(results_url).json()['data']['results']
+
+        self.assertEqual(api[0]['id'], bob_song.pk)
+        self.assertEqual(api[0]['place'], 1)
+        self.assertEqual(api[0]['submitter']['username'], self.bob.username)
+        self.assertContains(html, 'result-two')
+        self.assertContains(html, '5.00 ★')
+
+    def test_ballot_progress_and_saved_scores_match_shared_service(self):
+        self.submission(self.alice, 'ballot-own')
+        bob_song = self.submission(self.bob, 'ballot-bob')
+        cara_song = self.submission(self.cara, 'ballot-cara')
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=bob_song, score=3,
+        )
+
+        response = self.client.get(reverse(
+            'api-v1:ballot', args=[self.round.pk],
+        ))
+        data = response.json()['data']
+        shared = ballot_for_user(self.round, self.alice)
+
+        self.assertEqual(data['eligible_count'], shared.eligible_count)
+        self.assertEqual(data['voted_count'], shared.voted_count)
+        self.assertEqual(data['complete'], shared.complete)
+        self.assertEqual(data['saved_scores'][str(bob_song.pk)], 3)
+        self.assertNotIn(str(cara_song.pk), data['saved_scores'])
+
+    def test_leaderboard_api_matches_html_and_scoring_service(self):
+        self.submission(self.alice, 'leaderboard-song')
+
+        html = self.client.get(reverse('leaderboard'))
+        api = self.client.get(reverse('api-v1:leaderboard')).json()['data']
+        html_entry = next(
+            row for row in html.context['players']
+            if row.item.pk == self.alice.pk
+        )
+        api_entry = next(
+            row for row in api['leaderboard']
+            if row['player']['id'] == self.alice.pk
+        )
+
+        self.assertEqual(api_entry['place'], html_entry.place)
+        self.assertEqual(
+            api_entry['total_score'], html_entry.item.total_score,
+        )
+        self.assertEqual(api_entry['submission_bonus'], 4)
+
+    def test_profile_api_history_is_revealed_only_and_uses_shared_badges(self):
+        self.submission(self.alice, 'unrevealed-private-track')
+        now = timezone.now()
+        revealed = Round.objects.create(
+            season=self.season,
+            prompt='Revealed profile round',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+        visible = Submission.objects.create(
+            round=revealed,
+            user=self.alice,
+            spotify_track_id='revealed-profile-track',
+            spotify_uri='spotify:track:revealed-profile-track',
+            spotify_url='https://open.spotify.com/track/revealed-profile-track',
+            title='Revealed profile track',
+            artist='Artist',
+        )
+
+        profile = self.client.get(reverse(
+            'api-v1:profile', args=[self.alice.username],
+        )).json()['data']
+        achievements = self.client.get(reverse(
+            'api-v1:achievements', args=[self.alice.username],
+        )).json()['data']
+
+        self.assertEqual([row['id'] for row in profile['history']], [visible.pk])
+        self.assertNotIn('unrevealed-private-track', json.dumps(profile))
+        self.assertEqual(profile['badges'], achievements['badges'])
+
+    def test_archived_round_is_only_in_archive_not_dashboard(self):
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(days=2)
+        self.round.reveal_at = now - timedelta(days=1)
+        self.round.archived = True
+        self.round.save(update_fields=[
+            'voting_deadline', 'reveal_at', 'archived',
+        ])
+
+        dashboard = self.client.get(
+            reverse('api-v1:dashboard'),
+        ).json()['data']
+        archive = self.client.get(reverse('api-v1:archive')).json()['data']
+
+        self.assertNotIn(
+            self.round.pk,
+            [card['round']['id'] for card in dashboard['cards']],
+        )
+        self.assertIn(
+            self.round.pk,
+            [row['id'] for row in archive['rounds']],
         )
 
 
