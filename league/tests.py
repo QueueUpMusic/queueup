@@ -1291,6 +1291,14 @@ class RoundStatusTests(QueueUpTestMixin, TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse('login'), response.url)
 
+    def test_control_rounds_requires_staff(self):
+        self.client.force_login(self.alice)
+
+        response = self.client.get(reverse('control_rounds'))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse('login'), response.url)
+
     def test_round_status_shows_submissions_and_voting_completion(self):
         alice_song = self.submission(self.alice, 'Alice Song')
         bob_song = self.submission(self.bob, 'Bob Song')
@@ -1311,7 +1319,16 @@ class RoundStatusTests(QueueUpTestMixin, TestCase):
         self.assertContains(response, 'Not started')
         self.assertContains(response, 'No submission')
 
+        self.assertEqual(
+            [row['player'].username for row in response.context['rows']],
+            ['alice', 'bob', 'cara', 'staff'],
+        )
         rows = {row['player'].username: row for row in response.context['rows']}
+        self.assertEqual(set(rows), {'alice', 'bob', 'cara', 'staff'})
+        self.assertIsNotNone(rows['alice']['submission'])
+        self.assertIsNotNone(rows['bob']['submission'])
+        self.assertIsNotNone(rows['cara']['submission'])
+        self.assertIsNone(rows['staff']['submission'])
         self.assertTrue(rows['alice']['voting_complete'])
         self.assertEqual(rows['alice']['voted_count'], 2)
         self.assertEqual(rows['alice']['eligible_count'], 2)
@@ -1319,6 +1336,12 @@ class RoundStatusTests(QueueUpTestMixin, TestCase):
         self.assertEqual(rows['bob']['voted_count'], 1)
         self.assertEqual(rows['bob']['eligible_count'], 2)
         self.assertFalse(rows['cara']['voting_started'])
+        self.assertFalse(rows['cara']['voting_complete'])
+        self.assertFalse(rows['staff']['voting_started'])
+        self.assertFalse(rows['staff']['voting_complete'])
+        self.assertEqual(rows['staff']['voted_count'], 0)
+        self.assertEqual(rows['staff']['eligible_count'], 3)
+        self.assertEqual(response.context['player_count'], 4)
         self.assertEqual(response.context['submitted_count'], 3)
         self.assertEqual(response.context['completed_count'], 1)
 
@@ -2100,16 +2123,33 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
             spotify_uri='spotify:track:count-b', spotify_url='https://open.spotify.com/track/count-b',
             title='Second', artist='Artist',
         )
+        third = Submission.objects.create(
+            round=self.round, user=self.cara, spotify_track_id='count-c',
+            spotify_uri='spotify:track:count-c',
+            spotify_url='https://open.spotify.com/track/count-c',
+            title='Third', artist='Artist',
+        )
         Vote.objects.create(round=self.round, voter=self.bob, submission=first, score=4)
         Vote.objects.create(round=self.round, voter=self.alice, submission=second, score=5)
         Vote.objects.create(round=self.round, voter=self.cara, submission=first, score=3)
+        Vote.objects.create(round=self.round, voter=self.alice, submission=third, score=4)
+        Vote.objects.create(round=self.round, voter=self.bob, submission=third, score=5)
+        Vote.objects.create(round=self.round, voter=self.cara, submission=second, score=4)
 
         response = self.client.get(reverse('control_rounds'))
         row = next(r for r in response.context['rounds'] if r.pk == self.round.pk)
-        self.assertEqual(row.submission_count, 2)
-        self.assertEqual(row.vote_count, 3)
+        self.assertEqual(Submission.objects.filter(round=self.round).count(), 3)
+        self.assertEqual(Vote.objects.filter(round=self.round).count(), 6)
+        self.assertEqual(row.submission_count, 3)
+        self.assertEqual(row.submitted_player_count, 3)
+        self.assertEqual(row.vote_count, 6)
 
     def test_round_cards_show_submission_and_completed_voter_progress(self):
+        inactive = User.objects.create_user(
+            'inactive-approved', password='x', is_active=False,
+        )
+        inactive.profile.approved = True
+        inactive.profile.save(update_fields=['approved'])
         alice_song = Submission.objects.create(
             round=self.round, user=self.alice, spotify_track_id='progress-a',
             spotify_uri='spotify:track:progress-a', spotify_url='https://open.spotify.com/track/progress-a',

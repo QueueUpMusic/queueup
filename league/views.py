@@ -31,10 +31,11 @@ from .spotify import api_get, exchange_code, extract_track_id, normalize_track, 
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .services import rounds as round_service
+from .services import round_status as round_status_service
 from .services import submissions as submission_service
 from .services import votes as vote_service
 from .push import send_user_push
-from .voting import completed_voter_ids, voting_progress
+from .voting import voting_progress
 
 
 def health(request):
@@ -485,32 +486,7 @@ def control_panel(request):
 @staff_required
 def control_rounds(request):
     query = request.GET.get('q', '').strip()
-    rounds = Round.objects.select_related('season').annotate(
-        submission_count=Count('submissions', distinct=True),
-        vote_count=Count('votes', distinct=True),
-        submitted_player_count=Count('submissions__user', distinct=True),
-    ).order_by('-submission_opens')
-    if query:
-        rounds = rounds.filter(
-            models.Q(prompt__icontains=query)
-            | models.Q(details__icontains=query)
-            | models.Q(season__name__icontains=query)
-        )
-
-    # League participation totals use all active approved players plus active
-    # staff/superusers. A voter counts only after completing every rating they
-    # were eligible to cast in that round.
-    league_player_ids = set(
-        User.objects.filter(is_active=True).filter(
-            models.Q(profile__approved=True)
-            | models.Q(is_staff=True)
-            | models.Q(is_superuser=True)
-        ).distinct().values_list('id', flat=True)
-    )
-    rounds = list(rounds)
-    for rnd in rounds:
-        rnd.league_player_count = len(league_player_ids)
-        rnd.completed_voter_count = len(completed_voter_ids(rnd) & league_player_ids)
+    rounds = round_status_service.control_rounds_with_status(query)
 
     return render(request, 'league/control_rounds.html', {
         'rounds': rounds,
@@ -559,52 +535,14 @@ def control_users(request):
 @staff_required
 def round_status(request, pk):
     rnd = get_object_or_404(Round.objects.select_related('season', 'host'), pk=pk)
-    submissions = list(rnd.submissions.select_related('user').order_by('submitted_at'))
-    submission_by_user = {submission.user_id: submission for submission in submissions}
-    submission_ids = {submission.id for submission in submissions}
-
-    votes_by_user = {}
-    for voter_id, submission_id in Vote.objects.filter(round=rnd).values_list('voter_id', 'submission_id'):
-        if submission_id in submission_ids:
-            votes_by_user.setdefault(voter_id, set()).add(submission_id)
-
-    participant_ids = set(submission_by_user) | set(votes_by_user)
-    players = User.objects.filter(
-        models.Q(profile__approved=True)
-        | models.Q(is_staff=True)
-        | models.Q(is_superuser=True)
-        | models.Q(pk__in=participant_ids)
-    ).select_related('profile').distinct().order_by('first_name', 'username')
-
-    rows = []
-    completed_count = 0
-    submitted_count = 0
-    for player in players:
-        submission = submission_by_user.get(player.pk)
-        if submission:
-            submitted_count += 1
-        eligible_ids = submission_ids - ({submission.id} if submission else set())
-        voted_ids = votes_by_user.get(player.pk, set()) & eligible_ids
-        eligible_count = len(eligible_ids)
-        voted_count = len(voted_ids)
-        voting_complete = bool(eligible_ids) and eligible_ids.issubset(voted_ids)
-        if voting_complete:
-            completed_count += 1
-        rows.append({
-            'player': player,
-            'submission': submission,
-            'voted_count': voted_count,
-            'eligible_count': eligible_count,
-            'voting_complete': voting_complete,
-            'voting_started': voted_count > 0,
-        })
+    participation = round_status_service.round_participation(rnd)
 
     return render(request, 'league/round_status.html', {
         'round': rnd,
-        'rows': rows,
-        'player_count': len(rows),
-        'submitted_count': submitted_count,
-        'completed_count': completed_count,
+        'rows': participation.rows,
+        'player_count': participation.player_count,
+        'submitted_count': participation.submitted_count,
+        'completed_count': participation.completed_count,
     })
 
 
