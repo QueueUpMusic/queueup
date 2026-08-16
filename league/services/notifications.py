@@ -4,8 +4,8 @@ from datetime import timedelta
 from django.contrib.auth.models import User
 from django.db import models
 
-from ..achievements import earned_badges
 from ..models import AchievementUnlock, PushSubscription, Submission
+from .achievements import earned_badges
 from .ballots import ballot_for_user
 
 

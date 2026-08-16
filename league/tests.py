@@ -21,6 +21,7 @@ from django.utils import timezone
 from .models import AchievementUnlock, Badge, NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, UserBadge, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
 from .services.ballots import ballot_for_user
+from .services.profiles import profile_for_user, profile_metrics as service_profile_metrics
 from .services.notifications import (
     achievement_notification_events,
     round_notification_events,
@@ -382,6 +383,66 @@ class RankingTests(QueueUpTestMixin, TestCase):
         ranked = {entry.item.id: entry.item for entry in ranked_submissions(self.round)}
         self.assertEqual(ranked[alice_song.id].vote_count, 1)
         self.assertEqual(ranked[alice_song.id].avg, 2)
+
+
+class ProfileReadServiceTests(QueueUpTestMixin, TestCase):
+    def test_profile_scores_exclude_an_incomplete_ballot_after_close(self):
+        alice_song = self.submission(self.alice, 'profile-alice')
+        bob_song = self.submission(self.bob, 'profile-bob')
+        self.submission(self.cara, 'profile-cara')
+
+        # Bob's single rating is an incomplete ballot and must not contribute.
+        Vote.objects.create(
+            round=self.round,
+            voter=self.bob,
+            submission=alice_song,
+            score=1,
+        )
+        # Cara completes both ratings she is eligible to cast.
+        Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=alice_song,
+            score=5,
+        )
+        Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=bob_song,
+            score=4,
+        )
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+
+        metrics = service_profile_metrics(self.alice, now=now)
+        submission = metrics.revealed.get(pk=alice_song.pk)
+        profile = profile_for_user(self.alice, now=now)
+
+        self.assertEqual(submission.vote_count, 1)
+        self.assertEqual(submission.avg, 5)
+        self.assertEqual(profile.avg_received, 5)
+        self.assertEqual(profile.round_count, 1)
+        self.assertEqual(list(profile.seasons), [self.season])
+
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('stats'))
+        self.assertEqual(response.context['avg_received'], 5)
+        self.assertContains(response, 'profile-alice')
+
+    def test_legacy_profile_metrics_contract_remains_available(self):
+        from .achievements import profile_metrics
+
+        metrics = profile_metrics(self.alice)
+
+        self.assertEqual(
+            set(metrics),
+            {
+                'submissions', 'revealed', 'wins', 'podiums', 'placements',
+                'ties_for_first', 'counted_vote_ids',
+            },
+        )
 
 
 class SeasonLeaderboardScoringTests(QueueUpTestMixin, TestCase):
@@ -1108,7 +1169,7 @@ class MembershipAndBadgeCommandTests(QueueUpTestMixin, TestCase):
         )
 
     def test_manual_badge_can_be_awarded_and_removed(self):
-        from .achievements import earned_badges, prestige_badges
+        from .services.achievements import earned_badges, prestige_badges
 
         self.client.force_login(self.staff)
         url = reverse(
@@ -1143,7 +1204,11 @@ class MembershipAndBadgeCommandTests(QueueUpTestMixin, TestCase):
         self.assertNotIn(self.manual_badge, prestige_badges(self.alice))
 
     def test_manual_award_does_not_override_automatic_achievement_logic(self):
-        from .achievements import achievement_checks, earned_badges, prestige_badges
+        from .services.achievements import (
+            achievement_checks,
+            earned_badges,
+            prestige_badges,
+        )
 
         automatic_badge = Badge.objects.create(
             name='Automatic First Entry',
@@ -1317,6 +1382,11 @@ class V70RoundPrivacyTests(QueueUpTestMixin, TestCase):
         self.client.force_login(self.bob)
         response = self.client.get(reverse('user_stats', args=[self.alice.username]))
         self.assertNotContains(response, 'secret')
+
+        profile = profile_for_user(self.alice)
+        self.assertEqual(list(profile.submissions), [])
+        self.assertEqual(profile.round_count, 0)
+        self.assertEqual(list(profile.seasons), [])
 
     def test_voting_round_keeps_submitters_anonymous(self):
         self.bob.first_name = 'Secret Submitter'
@@ -1790,7 +1860,7 @@ class GenreHopperAchievementTests(QueueUpTestMixin, TestCase):
         )
 
     def test_one_song_with_many_subgenres_counts_as_only_one_main_genre(self):
-        from .achievements import achievement_checks
+        from .services.achievements import achievement_checks
         from .models import Submission
 
         rnd = self._revealed_round(1)
@@ -1804,7 +1874,7 @@ class GenreHopperAchievementTests(QueueUpTestMixin, TestCase):
         self.assertFalse(achievement_checks(self.alice)['genre_hopper'])
 
     def test_unrevealed_round_does_not_count_toward_genre_hopper(self):
-        from .achievements import achievement_checks
+        from .services.achievements import achievement_checks
         from .models import Submission
 
         broad_genres = [
@@ -1830,7 +1900,7 @@ class GenreHopperAchievementTests(QueueUpTestMixin, TestCase):
         self.assertFalse(achievement_checks(self.alice)['genre_hopper'])
 
     def test_ten_completed_songs_in_ten_main_genres_unlocks(self):
-        from .achievements import achievement_checks
+        from .services.achievements import achievement_checks
         from .models import Submission
 
         genre_tags = [

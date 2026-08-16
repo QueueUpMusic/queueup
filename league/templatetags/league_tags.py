@@ -1,5 +1,5 @@
 from django import template
-from league.achievements import prestige_badges
+from league.services.achievements import prestige_badges
 
 register = template.Library()
 

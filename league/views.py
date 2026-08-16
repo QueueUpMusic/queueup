@@ -1,5 +1,4 @@
 import json
-from collections import Counter
 import io
 import secrets
 import base64
@@ -12,7 +11,7 @@ from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.auth.models import User
 from django.db import models
-from django.db.models import Avg, Count
+from django.db.models import Count
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
@@ -23,12 +22,13 @@ from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.cache import never_cache
 
 from .forms import BadgeForm, ProfileForm, ProfilePictureForm, RoundForm, SeasonForm, SignupForm, VoteForm
-from .achievements import earned_badges, prestige_badges, profile_metrics
+from .services.achievements import earned_badges, prestige_badges
 from .realtime import broadcast
 from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserProfile, Vote
 from .spotify import api_get, exchange_code, extract_track_id, normalize_track, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
+from .services.profiles import profile_for_user
 from .services import rounds as round_service
 from .services import round_status as round_status_service
 from .services import badges as badge_service
@@ -250,24 +250,23 @@ def leaderboard(request):
 def stats(request, username=None):
     profile_user = get_object_or_404(User, username=username) if username else request.user
     season_id = request.GET.get('season')
-    seasons = Season.objects.filter(rounds__submissions__user=profile_user, rounds__reveal_at__lte=timezone.now()).distinct().order_by('-starts_at')
-    selected_season = seasons.filter(pk=season_id).first() if season_id else None
-    metrics = profile_metrics(profile_user, selected_season)
-    submissions = metrics['revealed'].order_by('-avg', '-submitted_at')
-    genres = Counter(g for sub in submissions for g in (sub.genres or []))
-    artists = Counter(sub.artist for sub in submissions)
-    placements = metrics['placements']
-    avg_placement = sum(placements) / len(placements) if placements else 0
-    avg_received = Vote.objects.filter(
-        submission__in=submissions, id__in=metrics['counted_vote_ids']
-    ).aggregate(value=Avg('score'))['value'] or 0
+    profile = profile_for_user(profile_user, season_id=season_id)
     return render(request, 'league/stats.html', {
-        'profile_user': profile_user, 'submissions': submissions[:20], 'best': submissions.first(),
-        'wins': metrics['wins'], 'podiums': metrics['podiums'], 'round_count': submissions.count(),
-        'genres': genres.most_common(8), 'artists': artists.most_common(8),
-        'avg_received': avg_received,
-        'avg_placement': avg_placement, 'win_rate': (metrics['wins'] / len(placements) * 100) if placements else 0,
-        'badges': earned_badges(profile_user), 'prestige_badges': prestige_badges(profile_user), 'seasons': seasons, 'selected_season': selected_season,
+        'profile_user': profile.profile_user,
+        'submissions': profile.submissions,
+        'best': profile.best,
+        'wins': profile.wins,
+        'podiums': profile.podiums,
+        'round_count': profile.round_count,
+        'genres': profile.genres,
+        'artists': profile.artists,
+        'avg_received': profile.avg_received,
+        'avg_placement': profile.avg_placement,
+        'win_rate': profile.win_rate,
+        'badges': earned_badges(profile_user),
+        'prestige_badges': prestige_badges(profile_user),
+        'seasons': profile.seasons,
+        'selected_season': profile.selected_season,
     })
 
 
