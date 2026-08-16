@@ -83,4 +83,12 @@ def create_submission(round_obj, user, track_reference):
                 explicit=False,
             )
     except IntegrityError as exc:
+        if (
+            track.get('isrc')
+            and Submission.objects.filter(
+                round=round_obj,
+                isrc=track['isrc'],
+            ).exists()
+        ):
+            raise DuplicateRecording from exc
         raise SubmissionConflict from exc

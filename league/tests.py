@@ -8,11 +8,12 @@ from PIL import Image
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
+from django.db import IntegrityError, transaction
 from django.core import mail
 from django.core.mail import get_connection
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
@@ -2221,6 +2222,99 @@ class SubmissionWorkflowTests(QueueUpTestMixin, TestCase):
         )
         self.assertEqual(player.submission_bonus, SUBMISSION_BONUS_POINTS)
         mocked_broadcast.assert_called_once()
+
+
+class SubmissionIsrcIntegrityTests(QueueUpTestMixin, TransactionTestCase):
+    def create_submission(self, round_obj, user, track_id, isrc):
+        return Submission.objects.create(
+            round=round_obj,
+            user=user,
+            spotify_track_id=track_id,
+            isrc=isrc,
+            spotify_uri=f'spotify:track:{track_id}',
+            spotify_url=f'https://open.spotify.com/track/{track_id}',
+            title=track_id,
+            artist='Artist',
+        )
+
+    def another_round(self):
+        now = timezone.now()
+        return Round.objects.create(
+            season=self.season,
+            prompt='Another round',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+
+    def test_same_isrc_in_same_round_is_rejected_by_database(self):
+        self.create_submission(self.round, self.alice, 'track-a', 'SAMEISRC')
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.create_submission(
+                self.round, self.bob, 'different-track', 'SAMEISRC',
+            )
+
+    def test_same_isrc_in_different_round_is_allowed(self):
+        self.create_submission(self.round, self.alice, 'track-a', 'SAMEISRC')
+
+        second = self.create_submission(
+            self.another_round(), self.bob, 'track-b', 'SAMEISRC',
+        )
+
+        self.assertIsNotNone(second.pk)
+
+    def test_different_isrcs_in_same_round_are_allowed(self):
+        self.create_submission(self.round, self.alice, 'track-a', 'ISRC-A')
+
+        second = self.create_submission(
+            self.round, self.bob, 'track-b', 'ISRC-B',
+        )
+
+        self.assertIsNotNone(second.pk)
+
+    def test_multiple_null_isrc_rows_and_same_track_id_are_allowed(self):
+        self.create_submission(self.round, self.alice, 'shared-track', None)
+
+        second = self.create_submission(
+            self.round, self.bob, 'shared-track', None,
+        )
+
+        self.assertIsNotNone(second.pk)
+
+    @patch(
+        'league.services.submissions.Submission.objects.create',
+        side_effect=IntegrityError('duplicate'),
+    )
+    @patch('league.services.submissions.Submission.objects.filter')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_service_maps_raced_isrc_conflict_to_duplicate_recording(
+        self, mocked_get, _mocked_genres, mocked_filter, _mocked_create,
+    ):
+        from .services import submissions as submission_service
+
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(hours=1)
+        self.round.submission_deadline = now + timedelta(hours=1)
+        self.round.save(update_fields=[
+            'submission_opens', 'submission_deadline',
+        ])
+        self.alice.profile.submission_rules_accepted_at = now
+        self.alice.profile.save(update_fields=['submission_rules_accepted_at'])
+        mocked_get.return_value = SubmissionWorkflowTests.spotify_track(
+            SubmissionWorkflowTests.first_track_id,
+            isrc='RACEISRC',
+        )
+        mocked_filter.return_value.exists.side_effect = [False, True]
+
+        with self.assertRaises(submission_service.DuplicateRecording):
+            submission_service.create_submission(
+                self.round,
+                self.alice,
+                SubmissionWorkflowTests.first_track_id,
+            )
 
 
 class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):

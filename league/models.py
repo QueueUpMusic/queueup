@@ -139,7 +139,11 @@ class Submission(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=['round', 'user'], name='one_submission_per_user_round'),
-            models.UniqueConstraint(fields=['round', 'spotify_track_id'], name='no_duplicate_track_per_round'),
+            models.UniqueConstraint(
+                fields=['round', 'isrc'],
+                condition=models.Q(isrc__isnull=False),
+                name='no_duplicate_isrc_per_round',
+            ),
         ]
 
     @property
