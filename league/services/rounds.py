@@ -24,6 +24,10 @@ class UnknownRoundAction(Exception):
     pass
 
 
+class RoundTransitionNotAllowed(Exception):
+    pass
+
+
 class RoundNotRevealed(Exception):
     pass
 
@@ -46,8 +50,19 @@ def save_round(round_obj, action):
 
 
 def apply_round_action(round_obj, action, now=None):
-    """Apply one of the existing manual round lifecycle transitions."""
+    """Apply a valid manual lifecycle transition without losing history."""
     now = now or timezone.now()
+    allowed_states = {
+        'open_submissions': {'upcoming', 'submitting'},
+        'open_voting': {'submitting', 'voting'},
+        'lock_voting': {'voting', 'locked'},
+        'reveal': {'voting', 'locked', 'revealed'},
+    }
+    if action not in allowed_states:
+        raise UnknownRoundAction
+    if round_obj.state not in allowed_states[action]:
+        raise RoundTransitionNotAllowed
+
     if action == 'open_submissions':
         round_obj.submission_opens = now
         if round_obj.submission_deadline <= now:
@@ -61,9 +76,9 @@ def apply_round_action(round_obj, action, now=None):
         if round_obj.reveal_at <= now:
             round_obj.reveal_at = now + timedelta(minutes=5)
     elif action == 'reveal':
+        if round_obj.voting_deadline > now:
+            round_obj.voting_deadline = now
         round_obj.reveal_at = now
-    else:
-        raise UnknownRoundAction
     round_obj.save()
     return round_obj
 

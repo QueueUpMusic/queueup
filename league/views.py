@@ -510,6 +510,9 @@ def round_action(request, pk, action):
         round_service.apply_round_action(rnd, action)
     except round_service.UnknownRoundAction:
         return HttpResponseBadRequest('Unknown action')
+    except round_service.RoundTransitionNotAllowed:
+        messages.error(request, 'That round cannot make this transition yet.')
+        return redirect('control_rounds')
     messages.success(request, f'Round updated: {action.replace("_", " ")}.')
     broadcast('round_updated', round_id=rnd.id, state=rnd.state)
     return redirect('control_rounds')

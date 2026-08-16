@@ -2541,7 +2541,7 @@ class RoundLifecycleCommandTests(QueueUpTestMixin, TestCase):
             'round_updated', round_id=self.round.id, state='revealed',
         )
 
-    def test_reveal_does_not_rewrite_future_voting_deadline(self):
+    def test_reveal_ends_future_voting_deadline_and_is_immediately_revealed(self):
         fixed_now = timezone.now()
         future_voting_deadline = fixed_now + timedelta(days=1)
         self.round.submission_opens = fixed_now - timedelta(days=2)
@@ -2552,11 +2552,53 @@ class RoundLifecycleCommandTests(QueueUpTestMixin, TestCase):
 
         mocked_broadcast = self.run_action('reveal', fixed_now)
 
-        self.assertEqual(self.round.voting_deadline, future_voting_deadline)
+        self.assertEqual(self.round.voting_deadline, fixed_now)
         self.assertEqual(self.round.reveal_at, fixed_now)
+        self.assertEqual(self.round.state, 'revealed')
         mocked_broadcast.assert_called_once_with(
-            'round_updated', round_id=self.round.id, state='voting',
+            'round_updated', round_id=self.round.id, state='revealed',
         )
+
+    def test_invalid_transition_is_rejected_without_changes_or_broadcast(self):
+        fixed_now = timezone.now()
+        self.round.submission_opens = fixed_now + timedelta(days=1)
+        self.round.submission_deadline = fixed_now + timedelta(days=2)
+        self.round.voting_deadline = fixed_now + timedelta(days=3)
+        self.round.reveal_at = fixed_now + timedelta(days=4)
+        self.round.save()
+        original_schedule = (
+            self.round.submission_opens,
+            self.round.submission_deadline,
+            self.round.voting_deadline,
+            self.round.reveal_at,
+        )
+
+        with (
+            patch(
+                'league.services.rounds.timezone.now',
+                return_value=fixed_now,
+            ),
+            patch('league.views.broadcast') as mocked_broadcast,
+        ):
+            response = self.client.post(
+                reverse('round_action', args=[self.round.pk, 'open_voting']),
+                follow=True,
+            )
+
+        self.round.refresh_from_db()
+        self.assertContains(
+            response, 'That round cannot make this transition yet.',
+        )
+        self.assertEqual(
+            (
+                self.round.submission_opens,
+                self.round.submission_deadline,
+                self.round.voting_deadline,
+                self.round.reveal_at,
+            ),
+            original_schedule,
+        )
+        mocked_broadcast.assert_not_called()
 
     def test_archive_preserves_schedule_submissions_votes_and_broadcast(self):
         fixed_now = timezone.now()
