@@ -20,6 +20,7 @@ from django.utils import timezone
 
 from .models import NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
+from .services.ballots import ballot_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .voting import voting_progress
 
@@ -87,6 +88,54 @@ class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
 
 
 class VotingTests(QueueUpTestMixin, TestCase):
+    def test_ballot_excludes_voters_own_submission(self):
+        own = self.submission(self.alice, 'own-ineligible')
+        bob_song = self.submission(self.bob, 'bob-eligible')
+        cara_song = self.submission(self.cara, 'cara-eligible')
+
+        ballot = ballot_for_user(self.round, self.alice)
+
+        self.assertEqual(ballot.eligible_ids, {bob_song.id, cara_song.id})
+        self.assertNotIn(own.id, ballot.eligible_ids)
+        self.assertEqual(ballot.eligible_count, 2)
+
+    def test_vote_endpoint_rejects_voters_own_submission(self):
+        own = self.submission(self.alice, 'own-blocked')
+        self.client.force_login(self.alice)
+
+        response = self.client.post(
+            reverse('vote', args=[self.round.pk, own.pk]),
+            {'score': 5},
+            follow=True,
+        )
+
+        self.assertContains(response, 'vote for your own song')
+        self.assertFalse(Vote.objects.filter(voter=self.alice, submission=own).exists())
+
+    def test_ballot_progress_tracks_saved_votes_and_completion(self):
+        self.submission(self.alice, 'own-progress')
+        bob_song = self.submission(self.bob, 'bob-progress')
+        cara_song = self.submission(self.cara, 'cara-progress')
+        Vote.objects.create(
+            round=self.round, voter=self.alice, submission=bob_song, score=3,
+        )
+
+        partial = ballot_for_user(self.round, self.alice)
+
+        self.assertEqual(partial.voted_ids, {bob_song.id})
+        self.assertEqual(partial.voted_count, 1)
+        self.assertEqual(partial.eligible_count, 2)
+        self.assertFalse(partial.complete)
+
+        Vote.objects.create(
+            round=self.round, voter=self.alice, submission=cara_song, score=4,
+        )
+
+        complete = ballot_for_user(self.round, self.alice)
+        self.assertEqual(complete.voted_ids, {bob_song.id, cara_song.id})
+        self.assertEqual(complete.voted_count, 2)
+        self.assertTrue(complete.complete)
+
     def test_completion_after_final_required_vote_and_on_revisit(self):
         own = self.submission(self.alice, 'own')
         bob_song = self.submission(self.bob, 'bob')
@@ -124,6 +173,10 @@ class VotingTests(QueueUpTestMixin, TestCase):
         response = self.client.get(reverse('round_detail', args=[self.round.pk]) + '?review=1')
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.context['vote_scores'],
+            {bob_song.id: 2, cara_song.id: 5},
+        )
         self.assertContains(response, 'name="score" value="2"', count=1)
         self.assertContains(response, 'name="score" value="5"', count=1)
 
@@ -799,12 +852,59 @@ class V70RoundPrivacyTests(QueueUpTestMixin, TestCase):
         response = self.client.get(reverse('user_stats', args=[self.alice.username]))
         self.assertNotContains(response, 'secret')
 
+    def test_voting_round_keeps_submitters_anonymous(self):
+        self.bob.first_name = 'Secret Submitter'
+        self.bob.save(update_fields=['first_name'])
+        self.submission(self.alice, 'own-secret')
+        self.submission(self.bob, 'anonymous-song')
+        self.client.force_login(self.alice)
+
+        response = self.client.get(reverse('round_detail', args=[self.round.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Mystery song')
+        self.assertNotContains(response, 'Secret Submitter')
+        self.assertNotContains(response, 'Picked by')
+
+    def test_revealed_round_still_shows_results_and_submitters(self):
+        self.bob.first_name = 'Revealed Submitter'
+        self.bob.save(update_fields=['first_name'])
+        alice_song = self.submission(self.alice, 'alice-result')
+        bob_song = self.submission(self.bob, 'revealed-song')
+        Vote.objects.create(
+            round=self.round, voter=self.cara, submission=alice_song, score=4,
+        )
+        Vote.objects.create(
+            round=self.round, voter=self.cara, submission=bob_song, score=5,
+        )
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+        self.client.force_login(self.alice)
+
+        response = self.client.get(reverse('round_detail', args=[self.round.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'revealed-song')
+        self.assertContains(response, 'Revealed Submitter')
+        self.assertContains(response, 'Picked by')
+        self.assertContains(response, '5.00 ★')
+
     def test_voting_guide_acknowledgement_is_persistent(self):
         self.client.force_login(self.alice)
         self.assertFalse(self.alice.profile.voting_guide_seen)
+        self.assertContains(
+            self.client.get(reverse('round_detail', args=[self.round.pk])),
+            'data-voting-guide',
+        )
         self.client.post(reverse('voting_guide_seen'))
         self.alice.profile.refresh_from_db()
         self.assertTrue(self.alice.profile.voting_guide_seen)
+        self.assertNotContains(
+            self.client.get(reverse('round_detail', args=[self.round.pk])),
+            'data-voting-guide',
+        )
 
 
 class V70CleanMusicTests(QueueUpTestMixin, TestCase):

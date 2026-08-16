@@ -28,8 +28,7 @@ from .achievements import earned_badges, prestige_badges, profile_metrics
 from .realtime import broadcast
 from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserBadge, UserProfile, Vote
 from .spotify import api_get, exchange_code, extract_track_id, genres_for_artists, normalize_track, spotify_authorize_url, user_api
-from .ranking import ranked_submissions
-from .services.rounds import homepage_rounds, revealed_rounds_for_archive
+from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .push import send_user_push
 from .voting import completed_voter_ids, voting_progress
@@ -92,24 +91,17 @@ def round_detail(request, pk):
     rnd = get_object_or_404(Round, pk=pk)
     if not rnd.is_visible and not request.user.is_staff:
         return HttpResponse(status=404)
-    mine = rnd.submissions.filter(user=request.user).first()
-    progress = voting_progress(rnd, request.user)
-    vote_scores = dict(
-        Vote.objects.filter(round=rnd, voter=request.user)
-        .values_list('submission_id', 'score')
-    )
-    ranked = ranked_submissions(rnd)
-    submissions = [entry.item for entry in ranked]
-    ranking_by_id = {entry.item.id: entry for entry in ranked}
-    winners = [entry.item for entry in ranked if entry.place == 1]
+    detail = round_detail_for_user(rnd, request.user)
     return render(request, 'league/round.html', {
-        'round': rnd, 'mine': mine, 'submissions': submissions,
-        'ranked_results': ranked, 'ranking_by_id': ranking_by_id, 'winners': winners,
-        'voted_ids': progress['voted_ids'], 'vote_scores': vote_scores,
-        'voted_count': progress['voted_count'],
-        'eligible_count': progress['eligible_count'], 'voting_complete': progress['complete'],
-        'no_votable_songs': progress['no_votable_songs'], 'vote_form': VoteForm(),
-        'show_voting_guide': rnd.state == 'voting' and not request.user.profile.voting_guide_seen,
+        'round': rnd, 'mine': detail.mine, 'submissions': detail.submissions,
+        'ranked_results': detail.ranked_results, 'ranking_by_id': detail.ranking_by_id,
+        'winners': detail.winners, 'voted_ids': detail.ballot.voted_ids,
+        'vote_scores': detail.ballot.vote_scores,
+        'voted_count': detail.ballot.voted_count,
+        'eligible_count': detail.ballot.eligible_count,
+        'voting_complete': detail.ballot.complete,
+        'no_votable_songs': detail.ballot.no_votable_songs,
+        'vote_form': VoteForm(), 'show_voting_guide': detail.show_voting_guide,
     })
 
 

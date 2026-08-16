@@ -1,7 +1,39 @@
+from dataclasses import dataclass
+
 from django.db import models
 from django.utils import timezone
 
 from ..models import Round
+from ..ranking import ranked_submissions
+from .ballots import BallotReadModel, ballot_for_user
+
+
+@dataclass(frozen=True)
+class RoundDetailReadModel:
+    mine: object
+    submissions: list
+    ranked_results: list
+    ranking_by_id: dict
+    winners: list
+    ballot: BallotReadModel
+    show_voting_guide: bool
+
+
+def round_detail_for_user(round_obj, user):
+    """Build the read model used to display a round to a league member."""
+    ranked = ranked_submissions(round_obj)
+    return RoundDetailReadModel(
+        mine=round_obj.submissions.filter(user=user).first(),
+        submissions=[entry.item for entry in ranked],
+        ranked_results=ranked,
+        ranking_by_id={entry.item.id: entry for entry in ranked},
+        winners=[entry.item for entry in ranked if entry.place == 1],
+        ballot=ballot_for_user(round_obj, user),
+        show_voting_guide=(
+            round_obj.state == 'voting'
+            and not user.profile.voting_guide_seen
+        ),
+    )
 
 
 def player_visible_rounds(now=None):
