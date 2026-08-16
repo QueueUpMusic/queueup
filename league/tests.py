@@ -18,7 +18,7 @@ from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from django.utils import timezone
 
-from .models import NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, Vote
+from .models import Badge, NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, UserBadge, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
 from .services.ballots import ballot_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
@@ -833,7 +833,8 @@ class V70MembershipTests(TestCase):
         self.assertRedirects(self.client.get(reverse('home')), reverse('waiting_approval'))
         self.assertEqual(self.client.get(reverse('notification_settings')).status_code, 200)
 
-    def test_staff_can_approve_user(self):
+    @patch('league.views.send_user_push')
+    def test_staff_can_approve_user_and_push_only_once(self, mocked_push):
         staff = User.objects.create_user('staff', password='x', is_staff=True)
         player = User.objects.create_user('pending', password='x')
         self.client.force_login(staff)
@@ -842,6 +843,191 @@ class V70MembershipTests(TestCase):
         player.profile.refresh_from_db()
         self.assertTrue(player.profile.approved)
         self.assertIsNotNone(player.profile.approved_at)
+        approved_at = player.profile.approved_at
+        mocked_push.assert_called_once_with(
+            player,
+            f'user:{player.pk}:approved',
+            'You’re approved!',
+            'Your QueueUp account is ready. Tap to enter the league.',
+            '/home/',
+        )
+
+        self.client.post(reverse('user_action', args=[player.pk, 'approve']))
+
+        player.profile.refresh_from_db()
+        self.assertEqual(player.profile.approved_at, approved_at)
+        mocked_push.assert_called_once()
+
+    def test_staff_can_deactivate_and_reactivate_user(self):
+        staff = User.objects.create_user('active-staff', password='x', is_staff=True)
+        player = User.objects.create_user('active-player', password='x')
+        self.client.force_login(staff)
+        action_url = reverse('user_action', args=[player.pk, 'toggle_active'])
+
+        first = self.client.post(action_url)
+        player.refresh_from_db()
+        self.assertRedirects(first, reverse('control_users'))
+        self.assertFalse(player.is_active)
+
+        second = self.client.post(action_url)
+        player.refresh_from_db()
+        self.assertRedirects(second, reverse('control_users'))
+        self.assertTrue(player.is_active)
+
+    @patch('league.views.send_user_push')
+    def test_staff_flag_toggle_preserves_automatic_approval_behavior(
+        self, mocked_push,
+    ):
+        staff = User.objects.create_user('staff-manager', password='x', is_staff=True)
+        player = User.objects.create_user('future-staff', password='x')
+        self.client.force_login(staff)
+        action_url = reverse('user_action', args=[player.pk, 'toggle_staff'])
+
+        self.client.post(action_url)
+
+        player.refresh_from_db()
+        player.profile.refresh_from_db()
+        self.assertTrue(player.is_staff)
+        self.assertTrue(player.profile.approved)
+        self.assertIsNotNone(player.profile.approved_at)
+        mocked_push.assert_not_called()
+
+        self.client.post(action_url)
+        player.refresh_from_db()
+        self.assertFalse(player.is_staff)
+        self.assertTrue(player.profile.approved)
+
+    def test_self_protection_actions_leave_staff_access_unchanged(self):
+        staff = User.objects.create_user('protected-staff', password='x', is_staff=True)
+        self.client.force_login(staff)
+
+        for action in ('toggle_active', 'toggle_staff'):
+            response = self.client.post(
+                reverse('user_action', args=[staff.pk, action]),
+                follow=True,
+            )
+            self.assertContains(response, 'You cannot remove your own access.')
+
+        staff.refresh_from_db()
+        self.assertTrue(staff.is_active)
+        self.assertTrue(staff.is_staff)
+
+    def test_players_search_still_filters_name_username_and_email(self):
+        staff = User.objects.create_user('search-staff', password='x', is_staff=True)
+        match = User.objects.create_user(
+            'membership-match',
+            first_name='Needle Name',
+            email='needle@example.com',
+            password='x',
+        )
+        other = User.objects.create_user('membership-other', password='x')
+        self.client.force_login(staff)
+
+        response = self.client.get(reverse('control_users'), {'q': 'needle'})
+
+        self.assertEqual(list(response.context['users']), [match])
+        self.assertContains(response, match.username)
+        self.assertNotContains(response, other.username)
+
+
+class MembershipAndBadgeCommandTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user(
+            'badge-staff', password='x', is_staff=True,
+        )
+        self.manual_badge = Badge.objects.create(
+            name='Manual Honor',
+            slug='manual-honor',
+            description='Awarded manually.',
+            icon='◆',
+        )
+
+    def test_manual_badge_can_be_awarded_and_removed(self):
+        from .achievements import earned_badges, prestige_badges
+
+        self.client.force_login(self.staff)
+        url = reverse(
+            'badge_award', args=[self.manual_badge.pk, self.alice.pk],
+        )
+
+        awarded_response = self.client.post(url, follow=True)
+
+        award = UserBadge.objects.get(user=self.alice, badge=self.manual_badge)
+        self.assertEqual(award.awarded_by, self.staff)
+        self.assertContains(awarded_response, 'Awarded Manual Honor to alice.')
+        manual_row = next(
+            row for row in earned_badges(self.alice)
+            if row['key'] == 'badge:manual-honor'
+        )
+        self.assertTrue(manual_row['earned'])
+        self.assertIn(self.manual_badge, prestige_badges(self.alice))
+
+        removed_response = self.client.post(url, follow=True)
+
+        self.assertFalse(
+            UserBadge.objects.filter(
+                user=self.alice, badge=self.manual_badge,
+            ).exists()
+        )
+        self.assertContains(removed_response, 'Removed Manual Honor from alice.')
+        manual_row = next(
+            row for row in earned_badges(self.alice)
+            if row['key'] == 'badge:manual-honor'
+        )
+        self.assertFalse(manual_row['earned'])
+        self.assertNotIn(self.manual_badge, prestige_badges(self.alice))
+
+    def test_manual_award_does_not_override_automatic_achievement_logic(self):
+        from .achievements import achievement_checks, earned_badges, prestige_badges
+
+        automatic_badge = Badge.objects.create(
+            name='Automatic First Entry',
+            slug='automatic-first-entry',
+            description='Requires a submission.',
+            achievement_key='first_pick',
+        )
+        self.client.force_login(self.staff)
+
+        self.client.post(reverse(
+            'badge_award', args=[automatic_badge.pk, self.alice.pk],
+        ))
+
+        self.assertTrue(
+            UserBadge.objects.filter(
+                user=self.alice, badge=automatic_badge,
+            ).exists()
+        )
+        self.assertFalse(achievement_checks(self.alice)['first_pick'])
+        automatic_row = next(
+            row for row in earned_badges(self.alice)
+            if row['key'] == 'first_pick'
+        )
+        self.assertFalse(automatic_row['earned'])
+        self.assertNotIn(automatic_badge, prestige_badges(self.alice))
+
+    def test_non_staff_cannot_mutate_membership_or_badges(self):
+        target = User.objects.create_user('protected-player', password='x')
+        self.client.force_login(self.alice)
+
+        membership_response = self.client.post(reverse(
+            'user_action', args=[target.pk, 'toggle_active'],
+        ))
+        badge_response = self.client.post(reverse(
+            'badge_award', args=[self.manual_badge.pk, target.pk],
+        ))
+
+        target.refresh_from_db()
+        self.assertEqual(membership_response.status_code, 302)
+        self.assertIn(reverse('login'), membership_response.url)
+        self.assertEqual(badge_response.status_code, 302)
+        self.assertIn(reverse('login'), badge_response.url)
+        self.assertTrue(target.is_active)
+        self.assertFalse(
+            UserBadge.objects.filter(
+                user=target, badge=self.manual_badge,
+            ).exists()
+        )
 
 
 @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')

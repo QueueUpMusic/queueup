@@ -26,12 +26,14 @@ from django.views.decorators.cache import never_cache
 from .forms import BadgeForm, ProfileForm, ProfilePictureForm, RoundForm, SeasonForm, SignupForm, VoteForm
 from .achievements import earned_badges, prestige_badges, profile_metrics
 from .realtime import broadcast
-from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserBadge, UserProfile, Vote
+from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserProfile, Vote
 from .spotify import api_get, exchange_code, extract_track_id, normalize_track, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .services import rounds as round_service
 from .services import round_status as round_status_service
+from .services import badges as badge_service
+from .services import membership as membership_service
 from .services import submissions as submission_service
 from .services import votes as vote_service
 from .push import send_user_push
@@ -52,10 +54,7 @@ def signup(request):
     form = SignupForm(request.POST or None)
     if request.method == 'POST' and form.is_valid():
         user = form.save()
-        profile, _ = UserProfile.objects.get_or_create(user=user)
-        profile.approved = bool(user.is_staff or user.is_superuser)
-        profile.approved_at = timezone.now() if profile.approved else None
-        profile.save(update_fields=['approved', 'approved_at'])
+        profile = membership_service.initialize_user_membership(user)
         login(request, user)
         return redirect('home' if profile.approved else 'waiting_approval')
     return render(request, 'league/signup.html', {'form': form})
@@ -641,28 +640,20 @@ def round_delete(request, pk):
 @require_POST
 def user_action(request, pk, action):
     target = get_object_or_404(User, pk=pk)
-    if target == request.user and action in {'deactivate','remove_staff'}:
-        messages.error(request, 'You cannot remove your own access.'); return redirect('control_users')
-    profile, _ = UserProfile.objects.get_or_create(user=target)
-    if action == 'toggle_staff':
-        target.is_staff = not target.is_staff
-        if target.is_staff and not profile.approved:
-            profile.approved = True
-            profile.approved_at = timezone.now()
-            profile.save(update_fields=['approved', 'approved_at'])
-    elif action == 'toggle_active':
-        target.is_active = not target.is_active
-    elif action == 'approve':
-        if not profile.approved:
-            profile.approved = True
-            profile.approved_at = timezone.now()
-            profile.save(update_fields=['approved', 'approved_at'])
+    try:
+        result = membership_service.apply_membership_action(
+            target, action, request.user,
+        )
+    except membership_service.SelfAccessChangeNotAllowed:
+        messages.error(request, 'You cannot remove your own access.')
+        return redirect('control_users')
+    except membership_service.UnknownMembershipAction:
+        return HttpResponseBadRequest('Unknown action')
+    if action == 'approve':
+        if result.approved_now:
             send_user_push(target, f'user:{target.pk}:approved', 'You’re approved!', 'Your QueueUp account is ready. Tap to enter the league.', '/home/')
         messages.success(request, f'Approved {target.username}.')
         return redirect('control_users')
-    else:
-        return HttpResponseBadRequest('Unknown action')
-    target.save(update_fields=['is_staff','is_active'])
     messages.success(request, f'Updated {target.username}.')
     return redirect('control_users')
 
@@ -761,9 +752,8 @@ def badge_edit(request, pk):
 def badge_award(request, badge_pk, user_pk):
     badge = get_object_or_404(Badge, pk=badge_pk)
     target = get_object_or_404(User, pk=user_pk)
-    award, created = UserBadge.objects.get_or_create(user=target, badge=badge, defaults={'awarded_by': request.user})
-    if not created:
-        award.delete()
+    result = badge_service.toggle_badge_award(target, badge, request.user)
+    if not result.awarded:
         messages.success(request, f'Removed {badge.name} from {target.username}.')
     else:
         messages.success(request, f'Awarded {badge.name} to {target.username}.')
