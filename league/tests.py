@@ -298,7 +298,7 @@ class HomeRoundVisibilityTests(QueueUpTestMixin, TestCase):
         self.client.force_login(staff)
         response = self.client.post(reverse('round_archive', args=[self.round.pk]))
 
-        self.assertRedirects(response, reverse('control_panel'))
+        self.assertRedirects(response, reverse('control_rounds'))
         self.round.refresh_from_db()
         self.assertTrue(self.round.archived)
 
@@ -308,7 +308,7 @@ class HomeRoundVisibilityTests(QueueUpTestMixin, TestCase):
 
         response = self.client.post(reverse('round_archive', args=[self.round.pk]))
 
-        self.assertRedirects(response, reverse('control_panel'))
+        self.assertRedirects(response, reverse('control_rounds'))
         self.round.refresh_from_db()
         self.assertFalse(self.round.archived)
 
@@ -404,7 +404,7 @@ class V70MembershipTests(TestCase):
         player = User.objects.create_user('pending', password='x')
         self.client.force_login(staff)
         response = self.client.post(reverse('user_action', args=[player.pk, 'approve']))
-        self.assertRedirects(response, reverse('control_panel'))
+        self.assertRedirects(response, reverse('control_users'))
         player.profile.refresh_from_db()
         self.assertTrue(player.profile.approved)
         self.assertIsNotNone(player.profile.approved_at)
@@ -612,10 +612,21 @@ class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
         self.client.force_login(self.alice)
         response = self.client.get(reverse('profile_edit'))
         content = response.content.decode()
+        profile_form = re.search(
+            rf'<form[^>]+action="{re.escape(reverse("profile_edit"))}".*?</form>',
+            content,
+            re.DOTALL,
+        ).group()
+        upload_form = re.search(
+            rf'<form[^>]+action="{re.escape(reverse("profile_picture_upload"))}".*?</form>',
+            content,
+            re.DOTALL,
+        ).group()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(content.count('name="csrfmiddlewaretoken"'), 1)
         self.assertContains(response, f'action="{reverse("profile_edit")}"')
         self.assertContains(response, f'action="{reverse("profile_picture_upload")}"')
+        self.assertIn('name="csrfmiddlewaretoken"', profile_form)
+        self.assertNotIn('name="csrfmiddlewaretoken"', upload_form)
         self.assertIn(settings.CSRF_COOKIE_NAME, response.cookies)
         self.assertIn('no-cache', response.headers.get('Cache-Control', ''))
 
@@ -768,8 +779,13 @@ class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
         client = Client(enforce_csrf_checks=True)
         self.assertTrue(client.login(username='alice', password='x'))
         page = client.get(reverse('profile_edit'))
+        remove_form = re.search(
+            rf'<form[^>]+action="{re.escape(reverse("profile_picture_remove"))}".*?</form>',
+            page.content.decode(),
+            re.DOTALL,
+        ).group()
         self.assertContains(page, f'action="{reverse("profile_picture_remove")}"')
-        self.assertEqual(page.content.decode().count('name="csrfmiddlewaretoken"'), 2)
+        self.assertIn('name="csrfmiddlewaretoken"', remove_form)
 
         blocked = client.post(reverse('profile_picture_remove'))
         self.assertEqual(blocked.status_code, 403)
@@ -825,9 +841,9 @@ class RoundStatusTests(QueueUpTestMixin, TestCase):
         self.assertEqual(response.context['submitted_count'], 3)
         self.assertEqual(response.context['completed_count'], 1)
 
-    def test_control_panel_links_each_round_to_status_page(self):
+    def test_control_rounds_links_each_round_to_status_page(self):
         self.client.force_login(self.staff)
-        response = self.client.get(reverse('control_panel'))
+        response = self.client.get(reverse('control_rounds'))
         self.assertContains(response, reverse('round_status', args=[self.round.pk]))
         self.assertContains(response, 'Round stats')
 
@@ -1118,8 +1134,8 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
         self.assertEqual(row.submitted_player_count, 2)
         self.assertEqual(row.league_player_count, 4)
         self.assertEqual(row.completed_voter_count, 3)
-        self.assertContains(response, '<b>2/4</b> people submitted', html=True)
-        self.assertContains(response, '<b>3/4</b> people voted', html=True)
+        self.assertContains(response, '<b>2/4</b> people submitted')
+        self.assertContains(response, '<b>3/4</b> people voted')
 
     def test_admin_sections_are_separate_and_searchable(self):
         response = self.client.get(reverse('control_panel'))
@@ -1130,7 +1146,7 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
         round_response = self.client.get(reverse('control_rounds'), {'q': self.round.prompt})
         self.assertContains(round_response, self.round.prompt)
         no_round_response = self.client.get(reverse('control_rounds'), {'q': 'not-a-real-prompt'})
-        self.assertNotContains(no_round_response, self.round.prompt)
+        self.assertEqual(list(no_round_response.context['rounds']), [])
 
         user_response = self.client.get(reverse('control_users'), {'q': self.alice.username})
         self.assertContains(user_response, self.alice.username)
