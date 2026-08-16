@@ -908,7 +908,7 @@ class V70RoundPrivacyTests(QueueUpTestMixin, TestCase):
 
 
 class V70CleanMusicTests(QueueUpTestMixin, TestCase):
-    @patch('league.views.api_get')
+    @patch('league.services.submissions.api_get')
     def test_explicit_track_is_rejected_server_side(self, mocked_get):
         self.round.submission_opens = timezone.now() - timedelta(hours=1)
         self.round.submission_deadline = timezone.now() + timedelta(hours=1)
@@ -1291,6 +1291,303 @@ class GenreHopperAchievementTests(QueueUpTestMixin, TestCase):
 
         self.assertTrue(achievement_checks(self.alice)['genre_hopper'])
 
+class SubmissionWorkflowTests(QueueUpTestMixin, TestCase):
+    first_track_id = 'AAAAAAAAAAAAAAAAAAAAAA'
+    second_track_id = 'BBBBBBBBBBBBBBBBBBBBBB'
+
+    def setUp(self):
+        super().setUp()
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(hours=1)
+        self.round.submission_deadline = now + timedelta(hours=1)
+        self.round.save(update_fields=['submission_opens', 'submission_deadline'])
+        self.client.force_login(self.alice)
+
+    def accept_rules(self):
+        self.alice.profile.submission_rules_accepted_at = timezone.now()
+        self.alice.profile.save(update_fields=['submission_rules_accepted_at'])
+
+    @staticmethod
+    def spotify_track(track_id, *, isrc='USABC1234567', explicit=False):
+        return {
+            'id': track_id,
+            'uri': f'spotify:track:{track_id}',
+            'external_urls': {
+                'spotify': f'https://open.spotify.com/track/{track_id}',
+            },
+            'external_ids': {'isrc': isrc},
+            'name': 'Verified Song',
+            'explicit': explicit,
+            'artists': [
+                {'id': 'artist-one', 'name': 'Artist One'},
+                {'id': 'artist-two', 'name': 'Artist Two'},
+            ],
+            'album': {
+                'name': 'Verified Album',
+                'images': [{'url': 'https://images.example/cover.jpg'}],
+            },
+            'preview_url': 'https://audio.example/preview.mp3',
+        }
+
+    def assert_user_has_no_score(self):
+        self.assertFalse(any(
+            entry.item.pk == self.alice.pk
+            for entry in season_leaderboard(self.season)
+        ))
+
+    @patch('league.views.broadcast')
+    @patch(
+        'league.services.submissions.genres_for_artists',
+        return_value=['alternative rock'],
+    )
+    @patch('league.services.submissions.api_get')
+    def test_success_preserves_metadata_bonus_and_realtime_event(
+        self, mocked_get, mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.return_value = self.spotify_track(self.first_track_id)
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {
+                'track_id': (
+                    f'https://open.spotify.com/track/{self.first_track_id}?si=test'
+                ),
+            },
+            follow=True,
+        )
+
+        submission = Submission.objects.get(round=self.round, user=self.alice)
+        self.assertEqual(submission.spotify_track_id, self.first_track_id)
+        self.assertEqual(submission.isrc, 'USABC1234567')
+        self.assertEqual(submission.spotify_uri, f'spotify:track:{self.first_track_id}')
+        self.assertEqual(
+            submission.spotify_url,
+            f'https://open.spotify.com/track/{self.first_track_id}',
+        )
+        self.assertEqual(submission.title, 'Verified Song')
+        self.assertEqual(submission.artist, 'Artist One, Artist Two')
+        self.assertEqual(submission.artist_ids, ['artist-one', 'artist-two'])
+        self.assertEqual(submission.genres, ['alternative rock'])
+        self.assertEqual(submission.album, 'Verified Album')
+        self.assertEqual(
+            submission.album_art_url,
+            'https://images.example/cover.jpg',
+        )
+        self.assertEqual(
+            submission.preview_url,
+            'https://audio.example/preview.mp3',
+        )
+        self.assertFalse(submission.explicit)
+        mocked_get.assert_called_once_with(f'/tracks/{self.first_track_id}')
+        mocked_genres.assert_called_once_with(['artist-one', 'artist-two'])
+        mocked_broadcast.assert_called_once_with(
+            'submission_added',
+            round_id=self.round.id,
+            submissions=1,
+        )
+        player = next(
+            entry.item
+            for entry in season_leaderboard(self.season)
+            if entry.item.pk == self.alice.pk
+        )
+        self.assertEqual(player.submission_bonus, SUBMISSION_BONUS_POINTS)
+        self.assertEqual(player.total_score, SUBMISSION_BONUS_POINTS)
+        self.assertContains(
+            response,
+            f'You earned {SUBMISSION_BONUS_POINTS} points for submitting!',
+        )
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_deleting_and_replacing_submission_restores_bonus(
+        self, mocked_get, _mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.side_effect = [
+            self.spotify_track(self.first_track_id, isrc='USFIRST12345'),
+            self.spotify_track(self.second_track_id, isrc='USSECOND1234'),
+        ]
+        submit_url = reverse('submit_song', args=[self.round.pk])
+
+        self.client.post(submit_url, {'track_id': self.first_track_id})
+        first = Submission.objects.get(round=self.round, user=self.alice)
+        self.assertEqual(
+            next(
+                entry.item
+                for entry in season_leaderboard(self.season)
+                if entry.item.pk == self.alice.pk
+            ).submission_bonus,
+            SUBMISSION_BONUS_POINTS,
+        )
+
+        first.delete()
+        self.assert_user_has_no_score()
+
+        self.client.post(submit_url, {'track_id': self.second_track_id})
+        replacement = Submission.objects.get(round=self.round, user=self.alice)
+        self.assertEqual(replacement.spotify_track_id, self.second_track_id)
+        self.assertEqual(
+            next(
+                entry.item
+                for entry in season_leaderboard(self.season)
+                if entry.item.pk == self.alice.pk
+            ).submission_bonus,
+            SUBMISSION_BONUS_POINTS,
+        )
+        self.assertEqual(mocked_broadcast.call_count, 2)
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.api_get')
+    def test_submission_outside_allowed_phase_is_rejected(
+        self, mocked_get, mocked_broadcast,
+    ):
+        self.round.submission_deadline = timezone.now() - timedelta(minutes=1)
+        self.round.save(update_fields=['submission_deadline'])
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(response, 'Submissions are closed.')
+        self.assertFalse(Submission.objects.filter(round=self.round).exists())
+        self.assert_user_has_no_score()
+        mocked_get.assert_not_called()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists')
+    @patch('league.services.submissions.api_get')
+    def test_submission_rules_acceptance_remains_required(
+        self, mocked_get, mocked_genres, mocked_broadcast,
+    ):
+        mocked_get.return_value = self.spotify_track(self.first_track_id)
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(
+            response,
+            'Please confirm the clean, all-ages music rule before submitting.',
+        )
+        self.assertFalse(Submission.objects.filter(round=self.round).exists())
+        self.assert_user_has_no_score()
+        mocked_genres.assert_not_called()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.api_get')
+    def test_spotify_refetch_failure_creates_nothing_and_awards_no_points(
+        self, mocked_get, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.side_effect = RuntimeError('Spotify unavailable')
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(response, 'That Spotify track could not be verified.')
+        self.assertFalse(Submission.objects.filter(round=self.round).exists())
+        self.assert_user_has_no_score()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists')
+    @patch('league.services.submissions.api_get')
+    def test_explicit_track_creates_nothing_and_awards_no_points(
+        self, mocked_get, mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.return_value = self.spotify_track(
+            self.first_track_id,
+            explicit=True,
+        )
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(response, 'No explicit songs allowed.')
+        self.assertFalse(Submission.objects.filter(round=self.round).exists())
+        self.assert_user_has_no_score()
+        mocked_genres.assert_not_called()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_same_isrc_duplicate_creates_nothing_and_awards_no_points(
+        self, mocked_get, _mocked_genres, mocked_broadcast,
+    ):
+        existing = self.submission(self.bob, 'existing-track')
+        existing.isrc = 'USABC1234567'
+        existing.save(update_fields=['isrc'])
+        self.accept_rules()
+        mocked_get.return_value = self.spotify_track(self.first_track_id)
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(
+            response,
+            'That recording has already been submitted for this round.',
+        )
+        self.assertFalse(
+            Submission.objects.filter(round=self.round, user=self.alice).exists()
+        )
+        self.assert_user_has_no_score()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_second_submission_by_same_user_preserves_existing_submission(
+        self, mocked_get, _mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.side_effect = [
+            self.spotify_track(self.first_track_id, isrc='USFIRST12345'),
+            self.spotify_track(self.second_track_id, isrc='USSECOND1234'),
+        ]
+        submit_url = reverse('submit_song', args=[self.round.pk])
+        self.client.post(submit_url, {'track_id': self.first_track_id})
+
+        response = self.client.post(
+            submit_url,
+            {'track_id': self.second_track_id},
+            follow=True,
+        )
+
+        submissions = Submission.objects.filter(round=self.round, user=self.alice)
+        self.assertEqual(submissions.count(), 1)
+        self.assertEqual(submissions.get().spotify_track_id, self.first_track_id)
+        self.assertContains(
+            response,
+            'You already submitted, or somebody chose that song first.',
+        )
+        player = next(
+            entry.item
+            for entry in season_leaderboard(self.season)
+            if entry.item.pk == self.alice.pk
+        )
+        self.assertEqual(player.submission_bonus, SUBMISSION_BONUS_POINTS)
+        mocked_broadcast.assert_called_once()
+
+
 class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):
     def setUp(self):
         super().setUp()
@@ -1337,8 +1634,8 @@ class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):
         self.assertEqual(track['isrc'], 'USABC1234567')
         self.assertTrue(track['used'])
 
-    @patch('league.views.genres_for_artists', return_value=[])
-    @patch('league.views.api_get')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
     def test_server_rejects_same_isrc_with_different_track_id(self, mocked_get, mocked_genres):
         Submission.objects.create(
             round=self.round, user=self.alice,
@@ -1358,8 +1655,8 @@ class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):
         self.assertContains(response, 'That recording has already been submitted for this round.')
         self.assertFalse(Submission.objects.filter(round=self.round, user=self.bob).exists())
 
-    @patch('league.views.genres_for_artists', return_value=[])
-    @patch('league.views.api_get')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
     def test_new_submission_saves_normalized_isrc(self, mocked_get, mocked_genres):
         mocked_get.return_value = self.spotify_track('CCCCCCCCCCCCCCCCCCCCCC', 'New Recording', 'usxyz7654321')
         self.client.force_login(self.alice)

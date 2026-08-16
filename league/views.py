@@ -11,7 +11,7 @@ from django.contrib import messages
 from django.contrib.auth import login
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.auth.models import User
-from django.db import IntegrityError, models
+from django.db import models
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db.models import Avg, Count
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
@@ -27,9 +27,10 @@ from .forms import BadgeForm, ProfileForm, ProfilePictureForm, RoundForm, Season
 from .achievements import earned_badges, prestige_badges, profile_metrics
 from .realtime import broadcast
 from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserBadge, UserProfile, Vote
-from .spotify import api_get, exchange_code, extract_track_id, genres_for_artists, normalize_track, spotify_authorize_url, user_api
+from .spotify import api_get, exchange_code, extract_track_id, normalize_track, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
+from .services import submissions as submission_service
 from .push import send_user_push
 from .voting import completed_voter_ids, voting_progress
 
@@ -149,39 +150,36 @@ def spotify_search(request):
 @require_POST
 def submit_song(request, pk):
     rnd = get_object_or_404(Round, pk=pk)
-    if rnd.state != 'submitting':
+    try:
+        submission_service.create_submission(
+            rnd,
+            request.user,
+            request.POST.get('track_id', ''),
+        )
+    except submission_service.SubmissionClosed:
         messages.error(request, 'Submissions are closed.')
         return redirect('round_detail', pk=pk)
-    track_id = extract_track_id(request.POST.get('track_id', ''))
-    if not track_id:
+    except submission_service.InvalidTrackReference:
         messages.error(request, 'That does not look like a valid Spotify track.')
         return redirect('song_picker', pk=pk)
-    try:
-        track = normalize_track(api_get(f'/tracks/{track_id}'))
-        if track.get('explicit'):
-            messages.error(request, 'Keep it clean please! No explicit songs allowed.')
-            return redirect('song_picker', pk=pk)
-        profile, _ = UserProfile.objects.get_or_create(user=request.user)
-        if not profile.submission_rules_accepted_at:
-            messages.error(request, 'Please confirm the clean, all-ages music rule before submitting.')
-            return redirect('song_picker', pk=pk)
-        genres = genres_for_artists(track['artist_ids'])
-        if track.get('isrc') and Submission.objects.filter(round=rnd, isrc=track['isrc']).exists():
-            messages.error(request, 'That recording has already been submitted for this round.')
-            return redirect('song_picker', pk=pk)
-    except Exception:
+    except submission_service.ExplicitTrack:
+        messages.error(request, 'Keep it clean please! No explicit songs allowed.')
+        return redirect('song_picker', pk=pk)
+    except submission_service.SubmissionRulesNotAccepted:
+        messages.error(request, 'Please confirm the clean, all-ages music rule before submitting.')
+        return redirect('song_picker', pk=pk)
+    except submission_service.DuplicateRecording:
+        messages.error(request, 'That recording has already been submitted for this round.')
+        return redirect('song_picker', pk=pk)
+    except submission_service.SpotifyVerificationFailed:
         messages.error(request, 'That Spotify track could not be verified.')
         return redirect('song_picker', pk=pk)
-    try:
-        Submission.objects.create(
-            round=rnd, user=request.user, spotify_track_id=track['id'], isrc=track.get('isrc') or None, spotify_uri=track['uri'],
-            spotify_url=track['url'], title=track['title'], artist=track['artist'], artist_ids=track['artist_ids'],
-            genres=genres, album=track['album'], album_art_url=track['art'], preview_url=track['preview'], explicit=False,
-        )
-        messages.success(request, f'Your song is locked in. You earned {SUBMISSION_BONUS_POINTS} points for submitting!')
-        broadcast('submission_added', round_id=rnd.id, submissions=rnd.submissions.count())
-    except IntegrityError:
+    except submission_service.SubmissionConflict:
         messages.error(request, 'You already submitted, or somebody chose that song first.')
+        return redirect('round_detail', pk=pk)
+
+    messages.success(request, f'Your song is locked in. You earned {SUBMISSION_BONUS_POINTS} points for submitting!')
+    broadcast('submission_added', round_id=rnd.id, submissions=rnd.submissions.count())
     return redirect('round_detail', pk=pk)
 
 
