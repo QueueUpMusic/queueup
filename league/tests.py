@@ -673,6 +673,150 @@ class VotingApiTests(QueueUpTestMixin, TestCase):
         self.assertEqual(ballot['saved_scores'][str(self.cara_song.pk)], 4)
 
 
+class AccountApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.alice)
+
+    def test_profile_update_is_csrf_protected_and_updates_display_name(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+        blocked = client.post(
+            reverse('api-v1:profile-update'),
+            data=json.dumps({'display_name': 'Blocked'}),
+            content_type='application/json',
+        )
+        client.get(reverse('api-v1:session'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+        updated = client.post(
+            reverse('api-v1:profile-update'),
+            data=json.dumps({'display_name': 'API Alice'}),
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=token,
+        )
+
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(updated.status_code, 200)
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.first_name, 'API Alice')
+
+    def test_current_season_acknowledgement_is_idempotent_and_hides_html_prompt(self):
+        url = reverse('api-v1:season-welcome')
+
+        first = self.client.post(url)
+        second = self.client.post(url)
+
+        self.assertTrue(first.json()['data']['created'])
+        self.assertFalse(second.json()['data']['created'])
+        self.assertEqual(SeasonWelcome.objects.filter(
+            user=self.alice, season=self.season,
+        ).count(), 1)
+        self.assertIsNone(self.client.get(reverse('home')).context['season_welcome'])
+
+    def test_onboarding_guide_and_submission_rules_are_persistent(self):
+        guide = self.client.post(reverse('api-v1:voting-guide'))
+        rules = self.client.post(reverse('api-v1:submission-rules'))
+        state = self.client.get(reverse('api-v1:onboarding')).json()['data']
+
+        self.alice.profile.refresh_from_db()
+        self.assertTrue(guide.json()['data']['voting_guide_seen'])
+        self.assertTrue(rules.json()['data']['submission_rules_accepted'])
+        self.assertTrue(self.alice.profile.voting_guide_seen)
+        self.assertIsNotNone(self.alice.profile.submission_rules_accepted_at)
+        self.assertTrue(state['voting_guide_seen'])
+        self.assertTrue(state['submission_rules_accepted'])
+
+    def test_push_api_registers_multiple_devices_and_removes_only_target(self):
+        url = reverse('api-v1:push-subscriptions')
+        first = {
+            'endpoint': 'https://push.example/device-one',
+            'keys': {'p256dh': 'p1', 'auth': 'a1'},
+        }
+        second = {
+            'endpoint': 'https://push.example/device-two',
+            'keys': {'p256dh': 'p2', 'auth': 'a2'},
+        }
+
+        self.client.post(
+            url, data=json.dumps(first), content_type='application/json',
+        )
+        self.client.post(
+            url, data=json.dumps(second), content_type='application/json',
+        )
+        removed = self.client.delete(
+            url,
+            data=json.dumps({'endpoint': first['endpoint']}),
+            content_type='application/json',
+        )
+        preferences = self.client.get(
+            reverse('api-v1:notifications'),
+        ).json()['data']
+
+        self.assertTrue(removed.json()['data']['removed'])
+        self.assertTrue(preferences['push_enabled'])
+        self.assertEqual(
+            [row['endpoint'] for row in preferences['subscriptions']],
+            [second['endpoint']],
+        )
+
+    def test_api_picture_upload_and_removal_are_csrf_protected(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+        picture_url = reverse('api-v1:profile-picture')
+        blocked = client.post(picture_url, {
+            'picture': SimpleUploadedFile(
+                'blocked.png', ProfileUploadCsrfTests.png_bytes(),
+                content_type='image/png',
+            ),
+        })
+        client.get(reverse('api-v1:session'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+        uploaded = client.post(
+            picture_url,
+            {'picture': SimpleUploadedFile(
+                'api-picture.png', ProfileUploadCsrfTests.png_bytes(),
+                content_type='image/png',
+            )},
+            HTTP_X_CSRFTOKEN=token,
+        )
+        removed = client.delete(
+            picture_url, HTTP_X_CSRFTOKEN=token,
+        )
+
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(uploaded.status_code, 200)
+        self.assertTrue(uploaded.json()['data']['picture_url'].endswith('.png'))
+        self.assertTrue(removed.json()['data']['removed'])
+        self.alice.profile.refresh_from_db()
+        self.assertFalse(bool(self.alice.profile.picture))
+
+    def test_api_raw_picture_fallback_preserves_normalization(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+        client.get(reverse('api-v1:session'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+
+        response = client.generic(
+            'POST', reverse('api-v1:profile-picture'),
+            ProfileUploadCsrfTests.jpeg_bytes(),
+            content_type='application/octet-stream',
+            HTTP_X_CSRFTOKEN=token,
+            HTTP_X_QUEUEUP_RAW_UPLOAD='1',
+            HTTP_X_QUEUEUP_FILENAME='iphone-photo.jpeg',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.alice.profile.refresh_from_db()
+        self.assertTrue(self.alice.profile.picture.name.endswith('.jpg'))
+        self.alice.profile.picture.delete(save=False)
+
+
 class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
     def setUp(self):
         super().setUp()

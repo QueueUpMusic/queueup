@@ -24,7 +24,7 @@ from django.views.decorators.cache import never_cache
 from .forms import BadgeForm, ProfileForm, ProfilePictureForm, RoundForm, SeasonForm, SignupForm, VoteForm
 from .services.achievements import earned_badges, prestige_badges
 from .realtime import broadcast
-from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserProfile, Vote
+from .models import Badge, Round, Season, SpotifyConnection, Submission, UserProfile, Vote
 from .spotify import exchange_code, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
@@ -34,6 +34,7 @@ from .services import rounds as round_service
 from .services import round_status as round_status_service
 from .services import badges as badge_service
 from .services import membership as membership_service
+from .services import notifications as notification_service
 from .services import media as media_service
 from .services import submissions as submission_service
 from .services import votes as vote_service
@@ -356,12 +357,9 @@ def archive(request):
 def push_subscribe(request):
     try:
         data = json.loads(request.body)
-        keys = data['keys']
-        PushSubscription.objects.update_or_create(
-            endpoint=data['endpoint'], defaults={'user': request.user, 'p256dh': keys['p256dh'], 'auth': keys['auth']}
-        )
+        notification_service.register_push_subscription(request.user, data)
         return JsonResponse({'ok': True})
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, notification_service.InvalidPushSubscription):
         return HttpResponseBadRequest('Invalid subscription')
 
 
@@ -370,7 +368,7 @@ def push_subscribe(request):
 def push_unsubscribe(request):
     try:
         endpoint = json.loads(request.body).get('endpoint')
-        PushSubscription.objects.filter(user=request.user, endpoint=endpoint).delete()
+        notification_service.remove_push_subscription(request.user, endpoint)
         return JsonResponse({'ok': True})
     except ValueError:
         return HttpResponseBadRequest('Invalid request')
@@ -627,26 +625,21 @@ def live_status(request):
 @require_POST
 def season_welcome_seen(request, pk):
     season = get_object_or_404(Season, pk=pk)
-    SeasonWelcome.objects.get_or_create(user=request.user, season=season)
+    membership_service.acknowledge_season(request.user, season)
     return JsonResponse({'ok': True})
 
 
 @login_required
 @require_POST
 def voting_guide_seen(request):
-    profile, _ = UserProfile.objects.get_or_create(user=request.user)
-    if not profile.voting_guide_seen:
-        profile.voting_guide_seen = True
-        profile.save(update_fields=['voting_guide_seen'])
+    membership_service.mark_voting_guide_seen(request.user)
     return JsonResponse({'ok': True})
 
 
 @login_required
 @require_POST
 def accept_submission_rules(request):
-    profile, _ = UserProfile.objects.get_or_create(user=request.user)
-    profile.submission_rules_accepted_at = timezone.now()
-    profile.save(update_fields=['submission_rules_accepted_at'])
+    membership_service.accept_submission_rules(request.user)
     return JsonResponse({'ok': True})
 
 

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from django.utils import timezone
 
-from ..models import UserProfile
+from ..models import Season, SeasonWelcome, UserProfile
 
 
 class UnknownMembershipAction(Exception):
@@ -17,6 +17,40 @@ class SelfAccessChangeNotAllowed(Exception):
 class MembershipMutationResult:
     target: object
     approved_now: bool = False
+
+
+def current_season(now=None):
+    now = now or timezone.now()
+    return Season.objects.filter(
+        active=True, starts_at__lte=now, ends_at__gte=now,
+    ).order_by('-starts_at').first()
+
+
+def acknowledge_season(user, season):
+    return SeasonWelcome.objects.get_or_create(user=user, season=season)
+
+
+def acknowledge_current_season(user, now=None):
+    season = current_season(now=now)
+    if not season:
+        return None, False
+    welcome, created = acknowledge_season(user, season)
+    return welcome, created
+
+
+def mark_voting_guide_seen(user):
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    if not profile.voting_guide_seen:
+        profile.voting_guide_seen = True
+        profile.save(update_fields=['voting_guide_seen'])
+    return profile
+
+
+def accept_submission_rules(user, now=None):
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    profile.submission_rules_accepted_at = now or timezone.now()
+    profile.save(update_fields=['submission_rules_accepted_at'])
+    return profile
 
 
 def initialize_user_membership(user, now=None):

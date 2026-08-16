@@ -12,6 +12,32 @@ from .ballots import ballot_for_user
 REMINDER_WINDOW = timedelta(hours=6)
 
 
+class InvalidPushSubscription(Exception):
+    pass
+
+
+def register_push_subscription(user, data):
+    try:
+        keys = data['keys']
+        endpoint = data['endpoint']
+        p256dh = keys['p256dh']
+        auth = keys['auth']
+    except (KeyError, TypeError):
+        raise InvalidPushSubscription
+    subscription, _ = PushSubscription.objects.update_or_create(
+        endpoint=endpoint,
+        defaults={'user': user, 'p256dh': p256dh, 'auth': auth},
+    )
+    return subscription
+
+
+def remove_push_subscription(user, endpoint):
+    deleted, _ = PushSubscription.objects.filter(
+        user=user, endpoint=endpoint,
+    ).delete()
+    return bool(deleted)
+
+
 @dataclass(frozen=True)
 class PushNotificationEvent:
     subscriptions: object
