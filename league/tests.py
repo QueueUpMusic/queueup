@@ -5,7 +5,10 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from asgiref.sync import async_to_sync
+from channels.testing import WebsocketCommunicator
 from django.conf import settings
+from django.contrib.auth.models import AnonymousUser
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.db import IntegrityError, transaction
@@ -56,6 +59,54 @@ class QueueUpTestMixin:
             round=self.round, user=user, spotify_track_id=track, spotify_uri=f'spotify:track:{track}',
             spotify_url=f'https://open.spotify.com/track/{track}', title=track, artist='Artist',
         )
+
+
+@override_settings(CHANNEL_LAYERS={
+    'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'},
+})
+class RealtimeAuthorizationTests(QueueUpTestMixin, TransactionTestCase):
+    def connection_accepted(self, user):
+        from .consumers import LeagueConsumer
+
+        async def connect():
+            communicator = WebsocketCommunicator(
+                LeagueConsumer.as_asgi(), '/ws/league/',
+            )
+            communicator.scope['user'] = user
+            accepted, _ = await communicator.connect()
+            if accepted:
+                await communicator.disconnect()
+            return accepted
+
+        return async_to_sync(connect)()
+
+    def test_anonymous_user_is_rejected(self):
+        self.assertFalse(self.connection_accepted(AnonymousUser()))
+
+    def test_pending_user_is_rejected(self):
+        pending = User.objects.create_user('pending-realtime', password='x')
+
+        self.assertFalse(self.connection_accepted(pending))
+
+    def test_approved_active_user_is_accepted(self):
+        self.assertTrue(self.connection_accepted(self.alice))
+
+    def test_staff_and_superuser_are_accepted_without_approval(self):
+        staff = User.objects.create_user(
+            'realtime-staff', password='x', is_staff=True,
+        )
+        superuser = User.objects.create_superuser(
+            'realtime-root', password='x', email='root@example.com',
+        )
+
+        self.assertTrue(self.connection_accepted(staff))
+        self.assertTrue(self.connection_accepted(superuser))
+
+    def test_inactive_approved_user_is_rejected(self):
+        self.alice.is_active = False
+        self.alice.save(update_fields=['is_active'])
+
+        self.assertFalse(self.connection_accepted(self.alice))
 
 
 class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
