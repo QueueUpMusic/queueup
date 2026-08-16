@@ -13,7 +13,7 @@ from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.auth.models import User
 from django.db import IntegrityError, models
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db.models import Avg, Count, Max, Sum
+from django.db.models import Avg, Count
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
@@ -28,12 +28,10 @@ from .achievements import earned_badges, prestige_badges, profile_metrics
 from .realtime import broadcast
 from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserBadge, UserProfile, Vote
 from .spotify import api_get, exchange_code, extract_track_id, genres_for_artists, normalize_track, spotify_authorize_url, user_api
-from .ranking import competition_rank, ranked_submissions
+from .ranking import ranked_submissions
+from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .push import send_user_push
-from .voting import completed_voter_ids, counted_vote_ids_for_rounds, voting_progress
-
-
-SUBMISSION_BONUS_POINTS = 4
+from .voting import completed_voter_ids, voting_progress
 
 
 def health(request):
@@ -263,21 +261,7 @@ def leaderboard(request):
 
     players = User.objects.none()
     if selected_season:
-        now = timezone.now()
-        revealed_rounds = list(selected_season.rounds.filter(reveal_at__lte=now, is_draft=False))
-        counted_vote_ids = counted_vote_ids_for_rounds(revealed_rounds, now=now)
-        season_filter = models.Q(submissions__round__season=selected_season, submissions__round__is_draft=False)
-        revealed_filter = season_filter & models.Q(submissions__round__reveal_at__lte=now)
-        counted_score_filter = revealed_filter & models.Q(submissions__votes__id__in=counted_vote_ids)
-        player_rows = list(User.objects.annotate(
-            vote_score=Sum('submissions__votes__score', filter=counted_score_filter),
-            rounds_played=Count('submissions', filter=season_filter, distinct=True),
-            latest_submission=Max('submissions__submitted_at', filter=season_filter),
-        ).filter(rounds_played__gt=0))
-        for player in player_rows:
-            player.submission_bonus = player.rounds_played * SUBMISSION_BONUS_POINTS
-            player.total_score = (player.vote_score or 0) + player.submission_bonus
-        players = competition_rank(player_rows, lambda player: player.total_score)
+        players = season_leaderboard(selected_season)
 
     return render(request, 'league/leaderboard.html', {
         'players': players,

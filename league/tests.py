@@ -20,6 +20,7 @@ from django.utils import timezone
 
 from .models import NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
+from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .voting import voting_progress
 
 
@@ -206,6 +207,162 @@ class RankingTests(QueueUpTestMixin, TestCase):
         ranked = {entry.item.id: entry.item for entry in ranked_submissions(self.round)}
         self.assertEqual(ranked[alice_song.id].vote_count, 1)
         self.assertEqual(ranked[alice_song.id].avg, 2)
+
+
+class SeasonLeaderboardScoringTests(QueueUpTestMixin, TestCase):
+    def leaderboard_entry(self, user):
+        return next(
+            entry
+            for entry in season_leaderboard(self.season)
+            if entry.item.pk == user.pk
+        )
+
+    def create_revealed_round(self, prompt):
+        now = timezone.now()
+        return Round.objects.create(
+            season=self.season,
+            prompt=prompt,
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+
+    @staticmethod
+    def create_submission(round_obj, user, track):
+        return Submission.objects.create(
+            round=round_obj,
+            user=user,
+            spotify_track_id=track,
+            spotify_uri=f'spotify:track:{track}',
+            spotify_url=f'https://open.spotify.com/track/{track}',
+            title=track,
+            artist='Artist',
+        )
+
+    def reveal_current_round(self):
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+
+    def test_submission_bonus_is_added_immediately(self):
+        self.submission(self.alice, 'bonus-now')
+
+        player = self.leaderboard_entry(self.alice).item
+
+        self.assertEqual(SUBMISSION_BONUS_POINTS, 4)
+        self.assertEqual(player.submission_bonus, 4)
+        self.assertEqual(player.total_score, 4)
+
+    def test_deleting_submission_removes_its_bonus(self):
+        first = self.submission(self.alice, 'bonus-first')
+        other_round = self.create_revealed_round('Other round')
+        second = self.create_submission(
+            other_round,
+            self.alice,
+            'bonus-second',
+        )
+        self.assertEqual(
+            self.leaderboard_entry(self.alice).item.submission_bonus,
+            8,
+        )
+
+        second.delete()
+
+        player = self.leaderboard_entry(self.alice).item
+        self.assertEqual(player.submission_bonus, 4)
+        self.assertEqual(player.rounds_played, 1)
+        self.assertTrue(Submission.objects.filter(pk=first.pk).exists())
+
+    def test_replacing_submission_restores_bonus(self):
+        original = self.submission(self.alice, 'bonus-original')
+        original.delete()
+        self.assertFalse(any(
+            entry.item.pk == self.alice.pk
+            for entry in season_leaderboard(self.season)
+        ))
+
+        self.submission(self.alice, 'bonus-replacement')
+
+        player = self.leaderboard_entry(self.alice).item
+        self.assertEqual(player.submission_bonus, 4)
+        self.assertEqual(player.total_score, 4)
+
+    def test_incomplete_ballot_is_excluded_from_leaderboard(self):
+        alice_song = self.submission(self.alice, 'score-alice')
+        bob_song = self.submission(self.bob, 'score-bob')
+        cara_song = self.submission(self.cara, 'score-cara')
+        Vote.objects.create(
+            round=self.round,
+            voter=self.alice,
+            submission=bob_song,
+            score=4,
+        )
+        Vote.objects.create(
+            round=self.round,
+            voter=self.alice,
+            submission=cara_song,
+            score=4,
+        )
+        Vote.objects.create(
+            round=self.round,
+            voter=self.bob,
+            submission=alice_song,
+            score=5,
+        )
+        self.reveal_current_round()
+
+        players = {
+            entry.item.pk: entry.item
+            for entry in season_leaderboard(self.season)
+        }
+
+        self.assertIsNone(players[self.alice.pk].vote_score)
+        self.assertEqual(players[self.alice.pk].total_score, 4)
+        self.assertEqual(players[self.bob.pk].total_score, 8)
+        self.assertEqual(players[self.cara.pk].total_score, 8)
+
+    def test_equal_scores_receive_tied_competition_rank(self):
+        alice_song = self.submission(self.alice, 'tie-alice')
+        bob_song = self.submission(self.bob, 'tie-bob')
+        Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=alice_song,
+            score=5,
+        )
+        Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=bob_song,
+            score=5,
+        )
+        self.reveal_current_round()
+
+        leaderboard = season_leaderboard(self.season)
+
+        self.assertEqual([entry.place for entry in leaderboard], [1, 1])
+        self.assertTrue(all(entry.tied for entry in leaderboard))
+        self.assertEqual([entry.item.total_score for entry in leaderboard], [9, 9])
+
+    def test_archived_round_remains_in_leaderboard(self):
+        alice_song = self.submission(self.alice, 'archived-alice')
+        Vote.objects.create(
+            round=self.round,
+            voter=self.bob,
+            submission=alice_song,
+            score=5,
+        )
+        self.reveal_current_round()
+        self.round.archived = True
+        self.round.save(update_fields=['archived'])
+
+        player = self.leaderboard_entry(self.alice).item
+
+        self.assertEqual(player.vote_score, 5)
+        self.assertEqual(player.submission_bonus, 4)
+        self.assertEqual(player.total_score, 9)
 
 
 class HomeRoundVisibilityTests(QueueUpTestMixin, TestCase):
