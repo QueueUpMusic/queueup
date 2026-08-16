@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import timedelta
 
 from django.db import models
 from django.utils import timezone
@@ -17,6 +18,63 @@ class RoundDetailReadModel:
     winners: list
     ballot: BallotReadModel
     show_voting_guide: bool
+
+
+class UnknownRoundAction(Exception):
+    pass
+
+
+class RoundNotRevealed(Exception):
+    pass
+
+
+def round_form_data_for_action(data, action, now=None):
+    """Apply the existing save-action timestamp override to round form data."""
+    if action == 'publish':
+        now = now or timezone.now()
+        data['goes_live_at'] = timezone.localtime(now).strftime(
+            '%Y-%m-%dT%H:%M:%S'
+        )
+    return data
+
+
+def save_round(round_obj, action):
+    """Persist the existing draft/save/publish state selected by staff."""
+    round_obj.is_draft = action == 'draft'
+    round_obj.save()
+    return round_obj
+
+
+def apply_round_action(round_obj, action, now=None):
+    """Apply one of the existing manual round lifecycle transitions."""
+    now = now or timezone.now()
+    if action == 'open_submissions':
+        round_obj.submission_opens = now
+        if round_obj.submission_deadline <= now:
+            round_obj.submission_deadline = now + timedelta(days=3)
+    elif action == 'open_voting':
+        round_obj.submission_deadline = now
+        if round_obj.voting_deadline <= now:
+            round_obj.voting_deadline = now + timedelta(days=2)
+    elif action == 'lock_voting':
+        round_obj.voting_deadline = now
+        if round_obj.reveal_at <= now:
+            round_obj.reveal_at = now + timedelta(minutes=5)
+    elif action == 'reveal':
+        round_obj.reveal_at = now
+    else:
+        raise UnknownRoundAction
+    round_obj.save()
+    return round_obj
+
+
+def archive_round(round_obj):
+    """Archive a completed round without altering its league history."""
+    if round_obj.state != 'revealed':
+        raise RoundNotRevealed
+    round_obj.archived = True
+    round_obj.save(update_fields=['archived'])
+    return round_obj
 
 
 def round_detail_for_user(round_obj, user):

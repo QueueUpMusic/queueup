@@ -30,6 +30,7 @@ from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, Spoti
 from .spotify import api_get, exchange_code, extract_track_id, normalize_track, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
+from .services import rounds as round_service
 from .services import submissions as submission_service
 from .services import votes as vote_service
 from .push import send_user_push
@@ -621,13 +622,11 @@ def season_create(request):
 def round_create(request):
     data = request.POST.copy() if request.method == 'POST' else None
     action = request.POST.get('save_action') if request.method == 'POST' else None
-    if action == 'publish':
-        data['goes_live_at'] = timezone.localtime().strftime('%Y-%m-%dT%H:%M:%S')
+    data = round_service.round_form_data_for_action(data, action)
     form = RoundForm(data)
     if request.method == 'POST' and form.is_valid():
         rnd = form.save(commit=False)
-        rnd.is_draft = action == 'draft'
-        rnd.save()
+        round_service.save_round(rnd, action)
         messages.success(request, 'Round saved as a draft.' if rnd.is_draft else ('Round published.' if action == 'publish' else 'Round created.'))
         return redirect('control_rounds')
     return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Create round', 'back_url': reverse('control_rounds'), 'round_actions': True})
@@ -637,24 +636,10 @@ def round_create(request):
 @require_POST
 def round_action(request, pk, action):
     rnd = get_object_or_404(Round, pk=pk)
-    now = timezone.now()
-    if action == 'open_submissions':
-        rnd.submission_opens = now
-        if rnd.submission_deadline <= now:
-            rnd.submission_deadline = now + timedelta(days=3)
-    elif action == 'open_voting':
-        rnd.submission_deadline = now
-        if rnd.voting_deadline <= now:
-            rnd.voting_deadline = now + timedelta(days=2)
-    elif action == 'lock_voting':
-        rnd.voting_deadline = now
-        if rnd.reveal_at <= now:
-            rnd.reveal_at = now + timedelta(minutes=5)
-    elif action == 'reveal':
-        rnd.reveal_at = now
-    else:
+    try:
+        round_service.apply_round_action(rnd, action)
+    except round_service.UnknownRoundAction:
         return HttpResponseBadRequest('Unknown action')
-    rnd.save()
     messages.success(request, f'Round updated: {action.replace("_", " ")}.')
     broadcast('round_updated', round_id=rnd.id, state=rnd.state)
     return redirect('control_rounds')
@@ -685,13 +670,11 @@ def round_edit(request, pk):
     rnd = get_object_or_404(Round, pk=pk)
     data = request.POST.copy() if request.method == 'POST' else None
     action = request.POST.get('save_action') if request.method == 'POST' else None
-    if action == 'publish':
-        data['goes_live_at'] = timezone.localtime().strftime('%Y-%m-%dT%H:%M:%S')
+    data = round_service.round_form_data_for_action(data, action)
     form = RoundForm(data, instance=rnd)
     if request.method == 'POST' and form.is_valid():
         rnd = form.save(commit=False)
-        rnd.is_draft = action == 'draft'
-        rnd.save()
+        round_service.save_round(rnd, action)
         broadcast('round_updated', round_id=rnd.id, state=rnd.state)
         messages.success(request, 'Round saved as a draft.' if rnd.is_draft else ('Round published.' if action == 'publish' else 'Round updated.'))
         return redirect('control_rounds')
@@ -701,11 +684,11 @@ def round_edit(request, pk):
 @require_POST
 def round_archive(request, pk):
     rnd = get_object_or_404(Round, pk=pk)
-    if rnd.state != 'revealed':
+    try:
+        round_service.archive_round(rnd)
+    except round_service.RoundNotRevealed:
         messages.error(request, 'Only completed rounds can be archived.')
         return redirect('control_rounds')
-    rnd.archived = True
-    rnd.save(update_fields=['archived'])
     messages.success(request, f'Archived “{rnd.prompt}”. It remains available on the Archive page.')
     broadcast('round_updated', round_id=rnd.id, state=rnd.state)
     return redirect('control_rounds')

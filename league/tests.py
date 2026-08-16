@@ -1780,6 +1780,219 @@ class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):
         submission = Submission.objects.get(round=self.round, user=self.alice)
         self.assertEqual(submission.isrc, 'USXYZ7654321')
 
+class RoundLifecycleCommandTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user(
+            'lifecycle-staff', password='x', is_staff=True,
+        )
+        self.client.force_login(self.staff)
+
+    def create_round_history(self):
+        alice_song = self.submission(self.alice, 'lifecycle-alice')
+        bob_song = self.submission(self.bob, 'lifecycle-bob')
+        vote = Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=alice_song,
+            score=4,
+        )
+        return alice_song.pk, bob_song.pk, vote.pk
+
+    def assert_round_history_preserved(self, history_ids):
+        alice_id, bob_id, vote_id = history_ids
+        self.assertTrue(Submission.objects.filter(pk=alice_id).exists())
+        self.assertTrue(Submission.objects.filter(pk=bob_id).exists())
+        self.assertTrue(Vote.objects.filter(pk=vote_id, score=4).exists())
+
+    def run_action(self, action, fixed_now):
+        with (
+            patch(
+                'league.services.rounds.timezone.now',
+                return_value=fixed_now,
+            ),
+            patch('league.views.broadcast') as mocked_broadcast,
+        ):
+            response = self.client.post(
+                reverse('round_action', args=[self.round.pk, action]),
+            )
+        self.assertRedirects(
+            response,
+            reverse('control_rounds'),
+            fetch_redirect_response=False,
+        )
+        self.round.refresh_from_db()
+        return mocked_broadcast
+
+    def test_open_submissions_sets_current_time_and_expired_default_duration(self):
+        fixed_now = timezone.now()
+        original_voting_deadline = fixed_now + timedelta(days=5)
+        original_reveal_at = fixed_now + timedelta(days=6)
+        self.round.submission_opens = fixed_now + timedelta(days=1)
+        self.round.submission_deadline = fixed_now - timedelta(minutes=1)
+        self.round.voting_deadline = original_voting_deadline
+        self.round.reveal_at = original_reveal_at
+        self.round.save()
+        history_ids = self.create_round_history()
+
+        mocked_broadcast = self.run_action('open_submissions', fixed_now)
+
+        self.assertEqual(self.round.submission_opens, fixed_now)
+        self.assertEqual(
+            self.round.submission_deadline,
+            fixed_now + timedelta(days=3),
+        )
+        self.assertEqual(self.round.voting_deadline, original_voting_deadline)
+        self.assertEqual(self.round.reveal_at, original_reveal_at)
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='submitting',
+        )
+
+    def test_open_voting_sets_current_time_and_expired_default_duration(self):
+        fixed_now = timezone.now()
+        original_opens = fixed_now - timedelta(days=3)
+        original_reveal_at = fixed_now + timedelta(days=6)
+        self.round.submission_opens = original_opens
+        self.round.submission_deadline = fixed_now + timedelta(days=1)
+        self.round.voting_deadline = fixed_now - timedelta(minutes=1)
+        self.round.reveal_at = original_reveal_at
+        self.round.save()
+        history_ids = self.create_round_history()
+
+        mocked_broadcast = self.run_action('open_voting', fixed_now)
+
+        self.assertEqual(self.round.submission_opens, original_opens)
+        self.assertEqual(self.round.submission_deadline, fixed_now)
+        self.assertEqual(
+            self.round.voting_deadline,
+            fixed_now + timedelta(days=2),
+        )
+        self.assertEqual(self.round.reveal_at, original_reveal_at)
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='voting',
+        )
+
+    def test_lock_voting_sets_current_time_and_expired_reveal_default(self):
+        fixed_now = timezone.now()
+        original_opens = fixed_now - timedelta(days=3)
+        original_submission_deadline = fixed_now - timedelta(days=1)
+        self.round.submission_opens = original_opens
+        self.round.submission_deadline = original_submission_deadline
+        self.round.voting_deadline = fixed_now + timedelta(days=1)
+        self.round.reveal_at = fixed_now - timedelta(minutes=1)
+        self.round.save()
+        history_ids = self.create_round_history()
+
+        mocked_broadcast = self.run_action('lock_voting', fixed_now)
+
+        self.assertEqual(self.round.submission_opens, original_opens)
+        self.assertEqual(
+            self.round.submission_deadline,
+            original_submission_deadline,
+        )
+        self.assertEqual(self.round.voting_deadline, fixed_now)
+        self.assertEqual(
+            self.round.reveal_at,
+            fixed_now + timedelta(minutes=5),
+        )
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='locked',
+        )
+
+    def test_reveal_sets_only_reveal_time_and_preserves_history(self):
+        fixed_now = timezone.now()
+        original_opens = fixed_now - timedelta(days=4)
+        original_submission_deadline = fixed_now - timedelta(days=3)
+        original_voting_deadline = fixed_now - timedelta(days=2)
+        self.round.submission_opens = original_opens
+        self.round.submission_deadline = original_submission_deadline
+        self.round.voting_deadline = original_voting_deadline
+        self.round.reveal_at = fixed_now + timedelta(days=1)
+        self.round.save()
+        history_ids = self.create_round_history()
+
+        mocked_broadcast = self.run_action('reveal', fixed_now)
+
+        self.assertEqual(self.round.submission_opens, original_opens)
+        self.assertEqual(
+            self.round.submission_deadline,
+            original_submission_deadline,
+        )
+        self.assertEqual(self.round.voting_deadline, original_voting_deadline)
+        self.assertEqual(self.round.reveal_at, fixed_now)
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='revealed',
+        )
+
+    def test_reveal_does_not_rewrite_future_voting_deadline(self):
+        fixed_now = timezone.now()
+        future_voting_deadline = fixed_now + timedelta(days=1)
+        self.round.submission_opens = fixed_now - timedelta(days=2)
+        self.round.submission_deadline = fixed_now - timedelta(days=1)
+        self.round.voting_deadline = future_voting_deadline
+        self.round.reveal_at = fixed_now + timedelta(days=2)
+        self.round.save()
+
+        mocked_broadcast = self.run_action('reveal', fixed_now)
+
+        self.assertEqual(self.round.voting_deadline, future_voting_deadline)
+        self.assertEqual(self.round.reveal_at, fixed_now)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='voting',
+        )
+
+    def test_archive_preserves_schedule_submissions_votes_and_broadcast(self):
+        fixed_now = timezone.now()
+        self.round.submission_opens = fixed_now - timedelta(days=4)
+        self.round.submission_deadline = fixed_now - timedelta(days=3)
+        self.round.voting_deadline = fixed_now - timedelta(days=2)
+        self.round.reveal_at = fixed_now - timedelta(days=1)
+        self.round.save()
+        original_schedule = (
+            self.round.submission_opens,
+            self.round.submission_deadline,
+            self.round.voting_deadline,
+            self.round.reveal_at,
+        )
+        history_ids = self.create_round_history()
+
+        with (
+            patch(
+                'league.services.rounds.timezone.now',
+                return_value=fixed_now,
+            ),
+            patch('league.views.broadcast') as mocked_broadcast,
+        ):
+            response = self.client.post(
+                reverse('round_archive', args=[self.round.pk]),
+            )
+
+        self.assertRedirects(
+            response,
+            reverse('control_rounds'),
+            fetch_redirect_response=False,
+        )
+        self.round.refresh_from_db()
+        self.assertTrue(self.round.archived)
+        self.assertEqual(
+            (
+                self.round.submission_opens,
+                self.round.submission_deadline,
+                self.round.voting_deadline,
+                self.round.reveal_at,
+            ),
+            original_schedule,
+        )
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='revealed',
+        )
+
+
 class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
     def setUp(self):
         super().setUp()
@@ -1843,7 +2056,10 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
         self.assertAlmostEqual(self.round.goes_live_at.timestamp(), scheduled_live.replace(second=0, microsecond=0).timestamp(), delta=1)
         self.assertFalse(self.round.is_visible)
 
-    def test_save_and_publish_activates_draft_and_overrides_go_live_time(self):
+    @patch('league.views.broadcast')
+    def test_save_and_publish_activates_draft_and_overrides_go_live_time(
+        self, mocked_broadcast,
+    ):
         self.round.is_draft = True
         self.round.save(update_fields=['is_draft'])
         before = timezone.now()
@@ -1859,6 +2075,9 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
         self.assertGreaterEqual(self.round.goes_live_at, before - timedelta(seconds=1))
         self.assertLessEqual(self.round.goes_live_at, timezone.now() + timedelta(seconds=1))
         self.assertTrue(self.round.is_visible)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='upcoming',
+        )
 
     def _reveal_round(self):
         now = timezone.now()
