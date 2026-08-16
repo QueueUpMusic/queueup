@@ -18,9 +18,15 @@ from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from django.utils import timezone
 
-from .models import Badge, NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, UserBadge, Vote
+from .models import AchievementUnlock, Badge, NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, UserBadge, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
 from .services.ballots import ballot_for_user
+from .services.notifications import (
+    achievement_notification_events,
+    round_notification_events,
+    submission_reminder_audience,
+    voting_reminder_audience,
+)
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .services import votes as vote_service
 from .voting import voting_progress
@@ -789,9 +795,153 @@ class NotificationTests(QueueUpTestMixin, TestCase):
     def test_command_is_idempotent_per_device_event(self, mocked_push):
         call_command('send_round_notifications')
         first = mocked_push.call_count
+        delivered_keys = set(
+            NotificationDelivery.objects.values_list('event_key', flat=True)
+        )
         call_command('send_round_notifications')
         self.assertEqual(mocked_push.call_count, first)
         self.assertEqual(NotificationDelivery.objects.count(), first)
+        self.assertEqual(delivered_keys, {f'round:{self.round.pk}:live'})
+
+    def test_submission_reminder_event_keeps_audience_key_and_payload(self):
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(days=1)
+        self.round.submission_deadline = now + timedelta(hours=5)
+        self.round.save()
+        self.submission(self.alice, 'own')
+
+        event = next(
+            event for event in round_notification_events(self.round, now)
+            if event.event_key.endswith(':submission-reminder-6h')
+        )
+
+        self.assertEqual(
+            list(event.subscriptions.values_list('endpoint', flat=True)),
+            ['https://push/b1'],
+        )
+        self.assertEqual(
+            event.event_key,
+            f'round:{self.round.pk}:submission-reminder-6h',
+        )
+        self.assertEqual(event.title, '6 hours left to submit')
+        self.assertEqual(
+            event.body,
+            'Choose a clean song for “Prompt” before submissions close.',
+        )
+        self.assertEqual(event.url, f'/round/{self.round.pk}/')
+
+    def test_reminders_keep_existing_six_hour_selection_window(self):
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(days=1)
+        self.round.submission_deadline = now + timedelta(hours=6)
+        self.round.voting_deadline = now + timedelta(days=1)
+        self.round.save()
+
+        at_boundary = {
+            event.event_key for event in round_notification_events(
+                self.round, now,
+            )
+        }
+        before_boundary = {
+            event.event_key for event in round_notification_events(
+                self.round, now - timedelta(seconds=1),
+            )
+        }
+
+        reminder_key = f'round:{self.round.pk}:submission-reminder-6h'
+        self.assertIn(reminder_key, at_boundary)
+        self.assertNotIn(reminder_key, before_boundary)
+
+    def test_submission_reminder_audience_excludes_existing_submitters(self):
+        self.submission(self.alice, 'own')
+
+        endpoints = submission_reminder_audience(self.round).values_list(
+            'endpoint', flat=True,
+        )
+
+        self.assertEqual(list(endpoints), ['https://push/b1'])
+
+    def test_voting_reminder_uses_complete_ballot_semantics(self):
+        alice_song = self.submission(self.alice, 'alice-song')
+        bob_song = self.submission(self.bob, 'bob-song')
+        cara_song = self.submission(self.cara, 'cara-song')
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=bob_song, score=5,
+        )
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=cara_song, score=4,
+        )
+        Vote.objects.create(
+            round=self.round, voter=self.bob,
+            submission=alice_song, score=3,
+        )
+
+        audience = voting_reminder_audience(self.round)
+
+        self.assertEqual(
+            list(audience.values_list('endpoint', flat=True)),
+            ['https://push/b1'],
+        )
+
+    def test_voting_reminder_event_keeps_key_and_payload(self):
+        now = timezone.now()
+        self.submission(self.alice, 'alice-song')
+        self.submission(self.bob, 'bob-song')
+        self.round.submission_deadline = now - timedelta(hours=1)
+        self.round.voting_deadline = now + timedelta(hours=5)
+        self.round.save()
+
+        event = next(
+            event for event in round_notification_events(self.round, now)
+            if event.event_key.endswith(':voting-reminder-6h')
+        )
+
+        self.assertEqual(
+            event.event_key,
+            f'round:{self.round.pk}:voting-reminder-6h',
+        )
+        self.assertEqual(event.title, '6 hours left to vote')
+        self.assertEqual(
+            event.body,
+            'Finish rating the songs for “Prompt”.',
+        )
+        self.assertEqual(event.url, f'/round/{self.round.pk}/')
+
+    def test_results_event_keeps_global_audience_key_and_payload(self):
+        now = timezone.now()
+        self.round.reveal_at = now - timedelta(minutes=1)
+        self.round.save(update_fields=['reveal_at'])
+
+        event = next(
+            event for event in round_notification_events(self.round, now)
+            if event.event_key.endswith(':results')
+        )
+
+        self.assertEqual(
+            set(event.subscriptions.values_list('endpoint', flat=True)),
+            {'https://push/a1', 'https://push/a2', 'https://push/b1'},
+        )
+        self.assertEqual(event.event_key, f'round:{self.round.pk}:results')
+        self.assertEqual(event.title, 'Results ready')
+        self.assertEqual(event.body, 'See who won “Prompt”.')
+        self.assertEqual(event.url, f'/round/{self.round.pk}/')
+
+    def test_achievement_event_keeps_audience_key_and_payload(self):
+        self.submission(self.alice, 'first-pick')
+
+        events = [
+            event for event in achievement_notification_events()
+            if event.user == self.alice and event.body == 'Submit your first song'
+        ]
+
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        unlock = AchievementUnlock.objects.get(user=self.alice, key='first_pick')
+        self.assertEqual(event.event_key, f'achievement:{unlock.pk}')
+        self.assertEqual(event.title, 'Badge unlocked')
+        self.assertEqual(event.url, '/stats/alice/')
 
     @patch('league.push.webpush')
     def test_submitter_not_sent_submission_reminder(self, mocked_push):
@@ -818,6 +968,20 @@ class NotificationTests(QueueUpTestMixin, TestCase):
         endpoints = [call.kwargs['subscription_info']['endpoint'] for call in reminder_calls]
         self.assertNotIn('https://push/a1', endpoints)
         self.assertNotIn('https://push/a2', endpoints)
+
+    @patch('league.push.webpush')
+    def test_each_subscribed_device_receives_an_event_once(self, mocked_push):
+        call_command('send_round_notifications')
+
+        live_calls = [
+            call for call in mocked_push.call_args_list
+            if f'round:{self.round.pk}:live' in call.kwargs['data']
+        ]
+        self.assertEqual(
+            {call.kwargs['subscription_info']['endpoint'] for call in live_calls},
+            {'https://push/a1', 'https://push/a2', 'https://push/b1'},
+        )
+        self.assertEqual(len(live_calls), 3)
 
 
 class V70MembershipTests(TestCase):
