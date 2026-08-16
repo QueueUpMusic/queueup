@@ -29,6 +29,7 @@ from .realtime import broadcast
 from .models import Badge, PushSubscription, Round, Season, SeasonWelcome, SpotifyConnection, Submission, UserBadge, UserProfile, Vote
 from .spotify import api_get, exchange_code, extract_track_id, genres_for_artists, normalize_track, spotify_authorize_url, user_api
 from .ranking import ranked_submissions
+from .services.rounds import homepage_rounds, revealed_rounds_for_archive
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .push import send_user_push
 from .voting import completed_voter_ids, voting_progress
@@ -75,26 +76,7 @@ def privacy(request):
 
 @login_required
 def home(request):
-    now = timezone.now()
-    visible = Round.objects.filter(
-        models.Q(goes_live_at__isnull=True) | models.Q(goes_live_at__lte=now),
-        archived=False,
-        is_draft=False,
-    )
-
-    # Keep the newest non-revealed round on the homepage, whether it is
-    # upcoming, accepting submissions, voting, or waiting for its reveal.
-    current = visible.filter(submission_opens__lte=now, reveal_at__gt=now).order_by('-submission_opens').first()
-    if current is None:
-        current = visible.filter(submission_opens__gt=now, reveal_at__gt=now).order_by('submission_opens').first()
-
-    # Keep the most recently completed, non-archived round visible too.
-    results_round = visible.filter(reveal_at__lte=now).order_by('-reveal_at').first()
-
-    # When there is no newer round, the latest results card is the only round
-    # shown. Avoid rendering the same round twice.
-    if current and results_round and current.pk == results_round.pk:
-        results_round = None
+    current, results_round = homepage_rounds()
 
     submission = Submission.objects.filter(round=current, user=request.user).first() if current else None
     return render(request, 'league/home.html', {
@@ -449,8 +431,9 @@ def remove_profile_picture(request):
 
 @login_required
 def archive(request):
-    now = timezone.now()
-    return render(request, 'league/archive.html', {'rounds': Round.objects.filter(reveal_at__lte=now, is_draft=False).filter(models.Q(goes_live_at__isnull=True) | models.Q(goes_live_at__lte=now)).order_by('-reveal_at')})
+    return render(request, 'league/archive.html', {
+        'rounds': revealed_rounds_for_archive(),
+    })
 
 
 @login_required

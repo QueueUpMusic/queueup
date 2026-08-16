@@ -390,6 +390,7 @@ class HomeRoundVisibilityTests(QueueUpTestMixin, TestCase):
 
         self.assertEqual(response.context['results_round'], self.round)
         self.assertEqual(response.context['round'], new_round)
+        self.assertFalse(response.context['current_first'])
         self.assertContains(response, 'Finished prompt')
         self.assertContains(response, 'New live prompt')
         self.assertLess(
@@ -442,6 +443,113 @@ class HomeRoundVisibilityTests(QueueUpTestMixin, TestCase):
         self.assertIsNone(home_response.context['results_round'])
         self.assertNotContains(home_response, self.round.prompt)
         self.assertContains(archive_response, self.round.prompt)
+        self.assertEqual(list(archive_response.context['rounds']), [self.round])
+
+    def test_newest_active_round_is_selected(self):
+        now = timezone.now()
+        self.round.prompt = 'Older active prompt'
+        self.round.save(update_fields=['prompt'])
+        newer_round = Round.objects.create(
+            season=self.season,
+            prompt='Newest active prompt',
+            goes_live_at=now - timedelta(hours=2),
+            submission_opens=now - timedelta(hours=1),
+            submission_deadline=now + timedelta(days=1),
+            voting_deadline=now + timedelta(days=2),
+            reveal_at=now + timedelta(days=3),
+        )
+
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('home'))
+
+        self.assertEqual(response.context['round'], newer_round)
+        self.assertContains(response, 'Newest active prompt')
+        self.assertNotContains(response, 'Older active prompt')
+
+    def test_most_recent_revealed_round_is_selected_for_results(self):
+        now = timezone.now()
+        self.round.prompt = 'Older results prompt'
+        self.round.submission_opens = now - timedelta(days=6)
+        self.round.submission_deadline = now - timedelta(days=5)
+        self.round.voting_deadline = now - timedelta(days=4)
+        self.round.reveal_at = now - timedelta(days=3)
+        self.round.save()
+        newer_results = Round.objects.create(
+            season=self.season,
+            prompt='Newest results prompt',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(hours=1),
+        )
+
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('home'))
+
+        self.assertIsNone(response.context['round'])
+        self.assertEqual(response.context['results_round'], newer_results)
+        self.assertContains(response, 'Newest results prompt')
+        self.assertNotContains(response, 'Older results prompt')
+
+    def test_archive_includes_all_revealed_rounds_in_reverse_reveal_order(self):
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(days=6)
+        self.round.submission_deadline = now - timedelta(days=5)
+        self.round.voting_deadline = now - timedelta(days=4)
+        self.round.reveal_at = now - timedelta(days=3)
+        self.round.save()
+        newer_archived = Round.objects.create(
+            season=self.season,
+            prompt='Newer archived result',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(hours=1),
+            archived=True,
+        )
+
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('archive'))
+
+        self.assertEqual(
+            list(response.context['rounds']),
+            [newer_archived, self.round],
+        )
+
+    def test_hidden_and_draft_rounds_stay_off_home_and_archive(self):
+        now = timezone.now()
+        self.round.prompt = 'Hidden upcoming prompt'
+        self.round.goes_live_at = now + timedelta(days=1)
+        self.round.save(update_fields=['prompt', 'goes_live_at'])
+        hidden_results = Round.objects.create(
+            season=self.season,
+            prompt='Hidden results prompt',
+            goes_live_at=now + timedelta(days=1),
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+        draft_results = Round.objects.create(
+            season=self.season,
+            prompt='Draft results prompt',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+            is_draft=True,
+        )
+
+        self.client.force_login(self.alice)
+        home_response = self.client.get(reverse('home'))
+        archive_response = self.client.get(reverse('archive'))
+
+        self.assertIsNone(home_response.context['round'])
+        self.assertIsNone(home_response.context['results_round'])
+        self.assertEqual(list(archive_response.context['rounds']), [])
+        for rnd in (self.round, hidden_results, draft_results):
+            self.assertNotContains(home_response, rnd.prompt)
+            self.assertNotContains(archive_response, rnd.prompt)
 
     def test_staff_can_archive_completed_round(self):
         now = timezone.now()
