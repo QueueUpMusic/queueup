@@ -32,6 +32,7 @@ from .services.spotify_search import search_tracks
 from .services.profiles import profile_for_user
 from .services import rounds as round_service
 from .services import round_status as round_status_service
+from .services import staff as staff_service
 from .services import badges as badge_service
 from .services import membership as membership_service
 from .services import notifications as notification_service
@@ -416,13 +417,7 @@ def control_rounds(request):
 @staff_required
 def control_badges(request):
     query = request.GET.get('q', '').strip()
-    badges = Badge.objects.order_by('sort_order', 'name')
-    if query:
-        badges = badges.filter(
-            models.Q(name__icontains=query)
-            | models.Q(description__icontains=query)
-            | models.Q(achievement_key__icontains=query)
-        )
+    badges = staff_service.badges(query)
     users = User.objects.select_related('profile').order_by('first_name', 'username')
     return render(request, 'league/control_badges.html', {
         'badges': badges,
@@ -434,16 +429,7 @@ def control_badges(request):
 @staff_required
 def control_users(request):
     query = request.GET.get('q', '').strip()
-    users = User.objects.select_related('profile').annotate(
-        play_count=Count('submissions', distinct=True)
-    ).order_by('-date_joined')
-    if query:
-        users = users.filter(
-            models.Q(username__icontains=query)
-            | models.Q(first_name__icontains=query)
-            | models.Q(last_name__icontains=query)
-            | models.Q(email__icontains=query)
-        )
+    users = staff_service.players(query)
     return render(request, 'league/control_users.html', {
         'users': users,
         'query': query,

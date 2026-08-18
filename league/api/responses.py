@@ -6,11 +6,13 @@ def success(data=None, status=200):
     return JsonResponse({'ok': True, 'data': data or {}}, status=status)
 
 
-def error(code, message, status):
-    return JsonResponse({
+def error(code, message, status, **kwargs):
+    data = {
         'ok': False,
         'error': {'code': code, 'message': message},
-    }, status=status)
+    }
+    data['error'].update(kwargs)
+    return JsonResponse(data, status=status)
 
 
 def csrf_failure(request, reason=''):

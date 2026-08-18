@@ -817,6 +817,124 @@ class AccountApiTests(QueueUpTestMixin, TestCase):
         self.alice.profile.picture.delete(save=False)
 
 
+class StaffReadApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user('api-staff', password='x', is_staff=True)
+
+    def test_staff_reads_require_staff(self):
+        self.client.force_login(self.alice)
+        for name in ('staff-overview', 'staff-rounds', 'staff-players', 'staff-badges', 'staff-seasons'):
+            response = self.client.get(reverse(f'api-v1:{name}'))
+            self.assertEqual(response.status_code, 403)
+
+    def test_round_status_and_counts_preserve_authoritative_aggregates(self):
+        alice_song = self.submission(self.alice, 'staff-api-a')
+        bob_song = self.submission(self.bob, 'staff-api-b')
+        Vote.objects.create(round=self.round, voter=self.cara, submission=alice_song, score=3)
+        Vote.objects.create(round=self.round, voter=self.cara, submission=bob_song, score=4)
+        self.client.force_login(self.staff)
+
+        rounds = self.client.get(reverse('api-v1:staff-rounds')).json()['data']['rounds']
+        current = next(value for value in rounds if value['id'] == self.round.pk)
+        self.assertEqual(current['submission_count'], 2)
+        self.assertEqual(current['vote_count'], 2)
+        response = self.client.get(reverse('api-v1:staff-round-status', args=[self.round.pk]))
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertEqual(data['submitted_count'], 2)
+        self.assertEqual(data['completed_count'], 1)
+
+    def test_player_badge_and_round_search_match_control_pages(self):
+        Badge.objects.create(name='Needle Badge', slug='needle-badge', description='Found')
+        self.client.force_login(self.staff)
+        players = self.client.get(reverse('api-v1:staff-players'), {'q': 'alice'}).json()['data']['players']
+        badges = self.client.get(reverse('api-v1:staff-badges'), {'q': 'Needle'}).json()['data']['badges']
+        rounds = self.client.get(reverse('api-v1:staff-rounds'), {'q': self.round.prompt}).json()['data']['rounds']
+        self.assertEqual([value['username'] for value in players], ['alice'])
+        self.assertEqual([value['slug'] for value in badges], ['needle-badge'])
+        self.assertEqual([value['id'] for value in rounds], [self.round.pk])
+        self.assertContains(self.client.get(reverse('control_users'), {'q': 'alice'}), 'alice')
+
+
+class StaffCommandApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user('api-staff-cmd', password='x', is_staff=True)
+        self.client.force_login(self.staff)
+
+    def test_approve_user_via_api(self):
+        player = User.objects.create_user('pending-api', password='x')
+        response = self.client.post(
+            reverse('api-v1:staff-user-action', args=[player.pk]),
+            data=json.dumps({'action': 'approve'}),
+            content_type='application/json'
+        )
+        self.assertEqual(response.status_code, 200)
+        player.profile.refresh_from_db()
+        self.assertTrue(player.profile.approved)
+
+    def test_round_lifecycle_actions_via_api(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='API Lifecycle',
+            submission_opens=now + timedelta(days=1),
+            submission_deadline=now + timedelta(days=2),
+            voting_deadline=now + timedelta(days=3),
+            reveal_at=now + timedelta(days=4),
+        )
+        url = reverse('api-v1:staff-round-action', args=[rnd.pk])
+
+        response = self.client.post(url, data=json.dumps({'action': 'open_submissions'}), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        rnd.refresh_from_db()
+        self.assertEqual(rnd.state, 'submitting')
+
+        response = self.client.post(url, data=json.dumps({'action': 'open_voting'}), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        rnd.refresh_from_db()
+        self.assertEqual(rnd.state, 'voting')
+
+    def test_badge_award_via_api(self):
+        badge = Badge.objects.create(name='API Badge', slug='api-badge', description='Test')
+        url = reverse('api-v1:staff-badge-award', args=[badge.pk, self.alice.pk])
+
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(UserBadge.objects.filter(user=self.alice, badge=badge).exists())
+
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(UserBadge.objects.filter(user=self.alice, badge=badge).exists())
+
+    def test_self_protection_via_api(self):
+        url = reverse('api-v1:staff-user-action', args=[self.staff.pk])
+        response = self.client.post(url, data=json.dumps({'action': 'toggle_active'}), content_type='application/json')
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error']['code'], 'self_access_change_not_allowed')
+
+    def test_round_save_and_delete_via_api(self):
+        create_url = reverse('api-v1:staff-round-create')
+        data = {
+            'season': self.season.pk,
+            'prompt': 'API New Round',
+            'submission_opens': '2026-08-18T10:00:00',
+            'submission_deadline': '2026-08-20T10:00:00',
+            'voting_deadline': '2026-08-22T10:00:00',
+            'reveal_at': '2026-08-22T10:05:00',
+            'save_action': 'save',
+        }
+        response = self.client.post(create_url, data=json.dumps(data), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        rnd_id = response.json()['data']['id']
+        self.assertTrue(Round.objects.filter(pk=rnd_id).exists())
+
+        delete_url = reverse('api-v1:staff-round-delete', args=[rnd_id])
+        response = self.client.delete(delete_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Round.objects.filter(pk=rnd_id).exists())
+
+
 class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
     def setUp(self):
         super().setUp()

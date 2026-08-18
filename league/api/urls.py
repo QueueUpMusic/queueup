@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import account_views, player_views, submission_views, views, voting_views
+from . import account_views, player_views, staff_views, submission_views, views, voting_views
 
 
 app_name = 'api-v1'
@@ -16,6 +16,24 @@ urlpatterns = [
     path('onboarding/submission-rules/', account_views.accept_submission_rules, name='submission-rules'),
     path('notifications/', account_views.notification_preferences, name='notifications'),
     path('push/subscriptions/', account_views.push_subscriptions, name='push-subscriptions'),
+    path('staff/', staff_views.overview, name='staff-overview'),
+    path('staff/rounds/', staff_views.rounds, name='staff-rounds'),
+    path('staff/rounds/create/', staff_views.round_save, name='staff-round-create'),
+    path('staff/rounds/<int:pk>/', staff_views.round_save, name='staff-round-edit'),
+    path('staff/rounds/<int:pk>/status/', staff_views.round_status, name='staff-round-status'),
+    path('staff/rounds/<int:pk>/action/', staff_views.round_action, name='staff-round-action'),
+    path('staff/rounds/<int:pk>/archive/', staff_views.round_archive, name='staff-round-archive'),
+    path('staff/rounds/<int:pk>/delete/', staff_views.round_delete, name='staff-round-delete'),
+    path('staff/rounds/<int:pk>/playlist/', staff_views.create_playlist, name='staff-round-playlist'),
+    path('staff/players/', staff_views.players, name='staff-players'),
+    path('staff/players/<int:pk>/action/', staff_views.user_action, name='staff-user-action'),
+    path('staff/badges/', staff_views.badges, name='staff-badges'),
+    path('staff/badges/create/', staff_views.badge_save, name='staff-badge-create'),
+    path('staff/badges/<int:pk>/', staff_views.badge_save, name='staff-badge-edit'),
+    path('staff/badges/<int:badge_pk>/award/<int:user_pk>/', staff_views.badge_award, name='staff-badge-award'),
+    path('staff/seasons/', staff_views.seasons, name='staff-seasons'),
+    path('staff/seasons/create/', staff_views.season_save, name='staff-season-create'),
+    path('staff/seasons/<int:pk>/', staff_views.season_save, name='staff-season-edit'),
     path('dashboard/', player_views.dashboard, name='dashboard'),
     path('seasons/', player_views.seasons, name='seasons'),
     path('archive/', player_views.archive, name='archive'),
