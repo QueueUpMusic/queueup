@@ -24,7 +24,7 @@ def season_summary(season):
 
 
 def round_summary(round_obj):
-    return {
+    data = {
         'id': round_obj.pk,
         'season': season_summary(round_obj.season),
         'prompt': round_obj.prompt,
@@ -35,9 +35,11 @@ def round_summary(round_obj):
         'voting_deadline': iso(round_obj.voting_deadline),
         'reveal_at': iso(round_obj.reveal_at),
         'archived': round_obj.archived,
-        'playlist_url': round_obj.playlist_url or None,
         'submission_count': round_obj.submissions.count(),
     }
+    if round_obj.state == 'revealed':
+        data['playlist_url'] = round_obj.playlist_url or None
+    return data
 
 
 def submission_track(submission):

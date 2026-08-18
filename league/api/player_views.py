@@ -78,16 +78,12 @@ def archive(request):
 def round_detail(request, pk):
     round_obj = _player_round(request, pk)
     detail = round_detail_for_user(round_obj, request.user)
-    eligible = round_obj.submissions.filter(
-        pk__in=detail.ballot.eligible_ids,
-    ).order_by('submitted_at', 'id')
     data = {
         'round': round_summary(round_obj),
         'my_submission': (
             submission_track(detail.mine) if detail.mine else None
         ),
         'ballot': {
-            'eligible_submissions': [submission_track(row) for row in eligible],
             'saved_scores': detail.ballot.vote_scores,
             'eligible_count': detail.ballot.eligible_count,
             'voted_count': detail.ballot.voted_count,
@@ -96,6 +92,13 @@ def round_detail(request, pk):
         },
         'show_voting_guide': detail.show_voting_guide,
     }
+    if round_obj.state == 'voting':
+        eligible = round_obj.submissions.filter(
+            pk__in=detail.ballot.eligible_ids,
+        ).order_by('submitted_at', 'id')
+        data['ballot']['eligible_submissions'] = [
+            submission_track(row) for row in eligible
+        ]
     if round_obj.state == 'revealed':
         data['results'] = [
             revealed_submission(entry.item, entry)
@@ -109,18 +112,20 @@ def round_detail(request, pk):
 def ballot(request, pk):
     round_obj = _player_round(request, pk)
     detail = round_detail_for_user(round_obj, request.user)
-    eligible = round_obj.submissions.filter(
-        pk__in=detail.ballot.eligible_ids,
-    ).order_by('submitted_at', 'id')
-    return success({
+    data = {
         'round_id': round_obj.pk,
-        'eligible_submissions': [submission_track(row) for row in eligible],
         'saved_scores': detail.ballot.vote_scores,
         'eligible_count': detail.ballot.eligible_count,
         'voted_count': detail.ballot.voted_count,
         'complete': detail.ballot.complete,
         'no_votable_songs': detail.ballot.no_votable_songs,
-    })
+    }
+    if round_obj.state == 'voting':
+        eligible = round_obj.submissions.filter(
+            pk__in=detail.ballot.eligible_ids,
+        ).order_by('submitted_at', 'id')
+        data['eligible_submissions'] = [submission_track(row) for row in eligible]
+    return success(data)
 
 
 @api_methods('GET')

@@ -935,6 +935,195 @@ class StaffCommandApiTests(QueueUpTestMixin, TestCase):
         self.assertFalse(Round.objects.filter(pk=rnd_id).exists())
 
 
+class ApiPrivacyRegressionTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.alice)
+
+    def test_submitting_round_does_not_expose_other_songs_via_round_detail(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Submitting Round',
+            submission_opens=now - timedelta(days=1),
+            submission_deadline=now + timedelta(days=1),
+            voting_deadline=now + timedelta(days=3),
+            reveal_at=now + timedelta(days=4),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a',
+            spotify_uri='spotify:track:t-a', title='Alice Song', artist='Alice Artist',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b',
+            spotify_uri='spotify:track:t-b', title='Bob Song', artist='Bob Artist',
+        )
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('my_submission', data)
+        self.assertIsNotNone(data['my_submission'])
+        self.assertIn('ballot', data)
+        self.assertNotIn('eligible_submissions', data['ballot'])
+
+    def test_submitting_round_does_not_expose_other_songs_via_ballot(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Submitting Round 2',
+            submission_opens=now - timedelta(days=1),
+            submission_deadline=now + timedelta(days=1),
+            voting_deadline=now + timedelta(days=3),
+            reveal_at=now + timedelta(days=4),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a2',
+            spotify_uri='spotify:track:t-a2', title='Alice Song 2', artist='Alice Artist 2',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b2',
+            spotify_uri='spotify:track:t-b2', title='Bob Song 2', artist='Bob Artist 2',
+        )
+        url = reverse('api-v1:ballot', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertNotIn('eligible_submissions', data)
+
+    def test_locked_round_does_not_expose_other_songs_via_round_detail(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Locked Round',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now - timedelta(hours=1),
+            reveal_at=now + timedelta(days=1),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a3',
+            spotify_uri='spotify:track:t-a3', title='Alice Song 3', artist='Alice Artist 3',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b3',
+            spotify_uri='spotify:track:t-b3', title='Bob Song 3', artist='Bob Artist 3',
+        )
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('ballot', data)
+        self.assertNotIn('eligible_submissions', data['ballot'])
+
+    def test_locked_round_does_not_expose_other_songs_via_ballot(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Locked Round 2',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now - timedelta(hours=1),
+            reveal_at=now + timedelta(days=1),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a4',
+            spotify_uri='spotify:track:t-a4', title='Alice Song 4', artist='Alice Artist 4',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b4',
+            spotify_uri='spotify:track:t-b4', title='Bob Song 4', artist='Bob Artist 4',
+        )
+        url = reverse('api-v1:ballot', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertNotIn('eligible_submissions', data)
+
+    def test_voting_round_exposes_anonymous_eligible_songs_and_saved_ratings(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Voting Round',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now + timedelta(days=1),
+            reveal_at=now + timedelta(days=2),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a5',
+            spotify_uri='spotify:track:t-a5', title='Alice Song 5', artist='Alice Artist 5',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b5',
+            spotify_uri='spotify:track:t-b5', title='Bob Song 5', artist='Bob Artist 5',
+        )
+        Vote.objects.create(round=rnd, voter=self.alice, submission=bob_sub, score=4)
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('ballot', data)
+        self.assertIn('eligible_submissions', data['ballot'])
+        self.assertEqual(len(data['ballot']['eligible_submissions']), 1)
+        sub = data['ballot']['eligible_submissions'][0]
+        self.assertEqual(sub['id'], bob_sub.pk)
+        self.assertEqual(data['ballot']['saved_scores'].get(str(bob_sub.pk)), 4)
+
+    def test_voting_round_ballot_endpoint_exposes_eligible_songs(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Voting Round 2',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now + timedelta(days=1),
+            reveal_at=now + timedelta(days=2),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a6',
+            spotify_uri='spotify:track:t-a6', title='Alice Song 6', artist='Alice Artist 6',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b6',
+            spotify_uri='spotify:track:t-b6', title='Bob Song 6', artist='Bob Artist 6',
+        )
+        url = reverse('api-v1:ballot', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('eligible_submissions', data)
+        self.assertEqual(len(data['eligible_submissions']), 1)
+
+    def test_playlist_url_not_exposed_before_reveal(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Playlist Test',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now + timedelta(hours=1),
+            reveal_at=now + timedelta(days=1),
+            playlist_url='https://open.spotify.com/playlist/test',
+        )
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('round', data)
+        self.assertNotIn('playlist_url', data['round'])
+
+    def test_playlist_url_exposed_after_reveal(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Playlist Test Revealed',
+            submission_opens=now - timedelta(days=3),
+            submission_deadline=now - timedelta(days=2),
+            voting_deadline=now - timedelta(days=1),
+            reveal_at=now - timedelta(hours=1),
+            playlist_url='https://open.spotify.com/playlist/test-revealed',
+        )
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('round', data)
+        self.assertEqual(data['round']['playlist_url'], 'https://open.spotify.com/playlist/test-revealed')
+
+
 class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
     def setUp(self):
         super().setUp()
