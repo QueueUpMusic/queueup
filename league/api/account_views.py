@@ -41,7 +41,7 @@ def update_profile(request):
 
 
 @api_methods('GET')
-@api_user_required
+@api_user_required(allow_pending=True)
 def onboarding_state(request):
     season = membership_service.current_season()
     profile = request.user.profile

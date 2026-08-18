@@ -1123,6 +1123,24 @@ class ApiPrivacyRegressionTests(QueueUpTestMixin, TestCase):
         self.assertIn('round', data)
         self.assertEqual(data['round']['playlist_url'], 'https://open.spotify.com/playlist/test-revealed')
 
+    def test_pending_user_can_access_onboarding_state(self):
+        pending = User.objects.create_user('pending-test', password='x')
+        self.client.force_login(pending)
+        url = reverse('api-v1:onboarding')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('season_welcome', data)
+        self.assertIn('voting_guide_seen', data)
+        self.assertIn('submission_rules_accepted', data)
+
+    def test_pending_user_cannot_access_protected_player_endpoints(self):
+        pending = User.objects.create_user('pending-test2', password='x')
+        self.client.force_login(pending)
+        url = reverse('api-v1:dashboard')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 403)
+
 
 class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
     def setUp(self):
