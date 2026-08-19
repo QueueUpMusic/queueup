@@ -1,6 +1,6 @@
 from django.utils import timezone
 
-from .achievements import prestige_badges
+from .services.achievements import prestige_badges
 from .models import Season
 
 

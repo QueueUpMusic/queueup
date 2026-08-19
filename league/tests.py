@@ -1,25 +1,40 @@
 import io
+import json
 import re
 from datetime import timedelta
 from unittest.mock import patch
 
 from PIL import Image
 
+from asgiref.sync import async_to_sync
+from channels.testing import WebsocketCommunicator
 from django.conf import settings
+from django.contrib.auth.models import AnonymousUser
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
+from django.db import IntegrityError, transaction
 from django.core import mail
 from django.core.mail import get_connection
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
-from django.test import TestCase, override_settings
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from django.utils import timezone
 
-from .models import NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, Vote
+from .models import AchievementUnlock, Badge, NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, UserBadge, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
+from .services.ballots import ballot_for_user
+from .services.profiles import profile_for_user, profile_metrics as service_profile_metrics
+from .services.notifications import (
+    achievement_notification_events,
+    round_notification_events,
+    submission_reminder_audience,
+    voting_reminder_audience,
+)
+from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
+from .services import votes as vote_service
 from .voting import voting_progress
 
 
@@ -45,6 +60,1086 @@ class QueueUpTestMixin:
             round=self.round, user=user, spotify_track_id=track, spotify_uri=f'spotify:track:{track}',
             spotify_url=f'https://open.spotify.com/track/{track}', title=track, artist='Artist',
         )
+
+
+@override_settings(CHANNEL_LAYERS={
+    'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'},
+})
+class RealtimeAuthorizationTests(QueueUpTestMixin, TransactionTestCase):
+    def connection_accepted(self, user):
+        from .consumers import LeagueConsumer
+
+        async def connect():
+            communicator = WebsocketCommunicator(
+                LeagueConsumer.as_asgi(), '/ws/league/',
+            )
+            communicator.scope['user'] = user
+            accepted, _ = await communicator.connect()
+            if accepted:
+                await communicator.disconnect()
+            return accepted
+
+        return async_to_sync(connect)()
+
+    def test_anonymous_user_is_rejected(self):
+        self.assertFalse(self.connection_accepted(AnonymousUser()))
+
+    def test_pending_user_is_rejected(self):
+        pending = User.objects.create_user('pending-realtime', password='x')
+
+        self.assertFalse(self.connection_accepted(pending))
+
+    def test_approved_active_user_is_accepted(self):
+        self.assertTrue(self.connection_accepted(self.alice))
+
+    def test_staff_and_superuser_are_accepted_without_approval(self):
+        staff = User.objects.create_user(
+            'realtime-staff', password='x', is_staff=True,
+        )
+        superuser = User.objects.create_superuser(
+            'realtime-root', password='x', email='root@example.com',
+        )
+
+        self.assertTrue(self.connection_accepted(staff))
+        self.assertTrue(self.connection_accepted(superuser))
+
+    def test_inactive_approved_user_is_rejected(self):
+        self.alice.is_active = False
+        self.alice.save(update_fields=['is_active'])
+
+        self.assertFalse(self.connection_accepted(self.alice))
+
+
+class ApiFoundationTests(QueueUpTestMixin, TestCase):
+    def test_anonymous_session_returns_json_401(self):
+        response = self.client.get(reverse('api-v1:session'))
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.json()['error']['code'],
+            'authentication_required',
+        )
+
+    def test_pending_user_can_read_session_but_not_league_api(self):
+        pending = User.objects.create_user('pending-api', password='x')
+        self.client.force_login(pending)
+
+        session_response = self.client.get(reverse('api-v1:session'))
+        api_response = self.client.get(reverse('api-v1:index'))
+
+        self.assertEqual(session_response.status_code, 200)
+        self.assertFalse(session_response.json()['data']['user']['approved'])
+        self.assertEqual(api_response.status_code, 403)
+        self.assertEqual(
+            api_response.json()['error']['code'],
+            'approval_required',
+        )
+
+    def test_approved_session_returns_current_user(self):
+        self.client.force_login(self.alice)
+
+        response = self.client.get(reverse('api-v1:session'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()['data']['user']['username'],
+            self.alice.username,
+        )
+        self.assertTrue(response.json()['data']['user']['approved'])
+
+    def test_staff_session_has_league_access_without_profile_approval(self):
+        staff = User.objects.create_user('api-staff', password='x', is_staff=True)
+        self.client.force_login(staff)
+
+        response = self.client.get(reverse('api-v1:index'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['version'], 'v1')
+
+    def test_api_mutations_require_csrf_and_use_json_error(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+
+        response = client.post(reverse('api-v1:index'))
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error']['code'], 'csrf_failed')
+
+    def test_api_method_errors_use_json_convention_with_valid_csrf(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+        client.get(reverse('api-v1:session'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+
+        response = client.post(
+            reverse('api-v1:index'),
+            HTTP_X_CSRFTOKEN=token,
+        )
+
+        self.assertEqual(response.status_code, 405)
+        self.assertEqual(
+            response.json()['error']['code'],
+            'method_not_allowed',
+        )
+
+
+class PlayerReadApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.alice)
+
+    def test_dashboard_matches_html_round_selection_and_order(self):
+        now = timezone.now()
+        previous = Round.objects.create(
+            season=self.season,
+            prompt='Previous result',
+            submission_opens=now - timedelta(days=5),
+            submission_deadline=now - timedelta(days=4),
+            voting_deadline=now - timedelta(days=3),
+            reveal_at=now - timedelta(days=2),
+        )
+        self.round.submission_opens = now + timedelta(days=1)
+        self.round.submission_deadline = now + timedelta(days=2)
+        self.round.voting_deadline = now + timedelta(days=3)
+        self.round.reveal_at = now + timedelta(days=4)
+        self.round.save()
+
+        html = self.client.get(reverse('home'))
+        api = self.client.get(reverse('api-v1:dashboard')).json()['data']
+
+        self.assertEqual(html.context['round'].pk, self.round.pk)
+        self.assertEqual(html.context['results_round'].pk, previous.pk)
+        self.assertEqual(
+            [(card['kind'], card['round']['id']) for card in api['cards']],
+            [('results', previous.pk), ('current', self.round.pk)],
+        )
+
+    def test_hidden_and_draft_rounds_are_not_available_to_players(self):
+        self.round.goes_live_at = timezone.now() + timedelta(days=1)
+        self.round.save(update_fields=['goes_live_at'])
+        draft = Round.objects.create(
+            season=self.season,
+            prompt='Private draft',
+            submission_opens=timezone.now() - timedelta(days=1),
+            submission_deadline=timezone.now() + timedelta(days=1),
+            voting_deadline=timezone.now() + timedelta(days=2),
+            reveal_at=timezone.now() + timedelta(days=3),
+            is_draft=True,
+        )
+
+        hidden_response = self.client.get(reverse(
+            'api-v1:round-detail', args=[self.round.pk],
+        ))
+        draft_response = self.client.get(reverse(
+            'api-v1:round-detail', args=[draft.pk],
+        ))
+
+        self.assertEqual(hidden_response.status_code, 404)
+        self.assertEqual(draft_response.status_code, 404)
+
+    def test_pre_reveal_round_and_ballot_do_not_leak_ownership_or_results(self):
+        self.bob.first_name = 'Private Submitter Identity'
+        self.bob.save(update_fields=['first_name'])
+        own = self.submission(self.alice, 'track-one')
+        other = self.submission(self.bob, 'track-two')
+        Vote.objects.create(
+            round=self.round,
+            voter=self.alice,
+            submission=other,
+            score=4,
+        )
+
+        response = self.client.get(reverse(
+            'api-v1:round-detail', args=[self.round.pk],
+        ))
+        data = response.json()['data']
+        serialized = json.dumps(data)
+
+        self.assertEqual(data['my_submission']['id'], own.pk)
+        self.assertEqual(
+            data['ballot']['saved_scores'][str(other.pk)], 4,
+        )
+        self.assertNotIn('results', data)
+        self.assertNotIn('Private Submitter Identity', serialized)
+        self.assertNotIn(self.bob.username, serialized)
+        eligible = data['ballot']['eligible_submissions'][0]
+        self.assertNotIn('submitter', eligible)
+        self.assertNotIn('user_id', eligible)
+        self.assertNotIn('average_score', eligible)
+        self.assertNotIn('place', eligible)
+
+    def test_results_are_unavailable_until_reveal_then_match_html(self):
+        alice_song = self.submission(self.alice, 'result-one')
+        bob_song = self.submission(self.bob, 'result-two')
+        Vote.objects.create(
+            round=self.round, voter=self.cara,
+            submission=alice_song, score=4,
+        )
+        Vote.objects.create(
+            round=self.round, voter=self.cara,
+            submission=bob_song, score=5,
+        )
+        results_url = reverse('api-v1:results', args=[self.round.pk])
+
+        self.assertEqual(self.client.get(results_url).status_code, 404)
+
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+        html = self.client.get(reverse('round_detail', args=[self.round.pk]))
+        api = self.client.get(results_url).json()['data']['results']
+
+        self.assertEqual(api[0]['id'], bob_song.pk)
+        self.assertEqual(api[0]['place'], 1)
+        self.assertEqual(api[0]['submitter']['username'], self.bob.username)
+        self.assertContains(html, 'result-two')
+        self.assertContains(html, '5.00 ★')
+
+    def test_ballot_progress_and_saved_scores_match_shared_service(self):
+        self.submission(self.alice, 'ballot-own')
+        bob_song = self.submission(self.bob, 'ballot-bob')
+        cara_song = self.submission(self.cara, 'ballot-cara')
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=bob_song, score=3,
+        )
+
+        response = self.client.get(reverse(
+            'api-v1:ballot', args=[self.round.pk],
+        ))
+        data = response.json()['data']
+        shared = ballot_for_user(self.round, self.alice)
+
+        self.assertEqual(data['eligible_count'], shared.eligible_count)
+        self.assertEqual(data['voted_count'], shared.voted_count)
+        self.assertEqual(data['complete'], shared.complete)
+        self.assertEqual(data['saved_scores'][str(bob_song.pk)], 3)
+        self.assertNotIn(str(cara_song.pk), data['saved_scores'])
+
+    def test_leaderboard_api_matches_html_and_scoring_service(self):
+        self.submission(self.alice, 'leaderboard-song')
+
+        html = self.client.get(reverse('leaderboard'))
+        api = self.client.get(reverse('api-v1:leaderboard')).json()['data']
+        html_entry = next(
+            row for row in html.context['players']
+            if row.item.pk == self.alice.pk
+        )
+        api_entry = next(
+            row for row in api['leaderboard']
+            if row['player']['id'] == self.alice.pk
+        )
+
+        self.assertEqual(api_entry['place'], html_entry.place)
+        self.assertEqual(
+            api_entry['total_score'], html_entry.item.total_score,
+        )
+        self.assertEqual(api_entry['submission_bonus'], 4)
+
+    def test_profile_api_history_is_revealed_only_and_uses_shared_badges(self):
+        self.submission(self.alice, 'unrevealed-private-track')
+        now = timezone.now()
+        revealed = Round.objects.create(
+            season=self.season,
+            prompt='Revealed profile round',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+        visible = Submission.objects.create(
+            round=revealed,
+            user=self.alice,
+            spotify_track_id='revealed-profile-track',
+            spotify_uri='spotify:track:revealed-profile-track',
+            spotify_url='https://open.spotify.com/track/revealed-profile-track',
+            title='Revealed profile track',
+            artist='Artist',
+        )
+
+        profile = self.client.get(reverse(
+            'api-v1:profile', args=[self.alice.username],
+        )).json()['data']
+        achievements = self.client.get(reverse(
+            'api-v1:achievements', args=[self.alice.username],
+        )).json()['data']
+
+        self.assertEqual([row['id'] for row in profile['history']], [visible.pk])
+        self.assertNotIn('unrevealed-private-track', json.dumps(profile))
+        self.assertEqual(profile['badges'], achievements['badges'])
+
+    def test_archived_round_is_only_in_archive_not_dashboard(self):
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(days=2)
+        self.round.reveal_at = now - timedelta(days=1)
+        self.round.archived = True
+        self.round.save(update_fields=[
+            'voting_deadline', 'reveal_at', 'archived',
+        ])
+
+        dashboard = self.client.get(
+            reverse('api-v1:dashboard'),
+        ).json()['data']
+        archive = self.client.get(reverse('api-v1:archive')).json()['data']
+
+        self.assertNotIn(
+            self.round.pk,
+            [card['round']['id'] for card in dashboard['cards']],
+        )
+        self.assertIn(
+            self.round.pk,
+            [row['id'] for row in archive['rounds']],
+        )
+
+
+class SubmissionApiTests(QueueUpTestMixin, TestCase):
+    track_id = 'ZZZZZZZZZZZZZZZZZZZZZZ'
+
+    def setUp(self):
+        super().setUp()
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(hours=1)
+        self.round.submission_deadline = now + timedelta(hours=1)
+        self.round.save(update_fields=[
+            'submission_opens', 'submission_deadline',
+        ])
+        self.client.force_login(self.alice)
+
+    @staticmethod
+    def spotify_track(track_id, isrc='APIISRC12345', explicit=False):
+        return {
+            'id': track_id,
+            'uri': f'spotify:track:{track_id}',
+            'external_urls': {
+                'spotify': f'https://open.spotify.com/track/{track_id}',
+            },
+            'external_ids': {'isrc': isrc},
+            'name': 'API Verified Song',
+            'explicit': explicit,
+            'artists': [{'id': 'artist-api', 'name': 'API Artist'}],
+            'album': {
+                'name': 'API Album',
+                'images': [{'url': 'https://images.example/api.jpg'}],
+            },
+            'preview_url': 'https://audio.example/api.mp3',
+        }
+
+    def accept_rules(self):
+        self.alice.profile.submission_rules_accepted_at = timezone.now()
+        self.alice.profile.save(update_fields=['submission_rules_accepted_at'])
+
+    @patch('league.api.submission_views.broadcast')
+    @patch('league.services.submissions.genres_for_artists', return_value=['rock'])
+    @patch('league.services.submissions.api_get')
+    def test_submission_api_refetches_stores_and_awards_authoritative_bonus(
+        self, mocked_get, _mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.return_value = self.spotify_track(self.track_id)
+
+        response = self.client.post(
+            reverse('api-v1:submission-create', args=[self.round.pk]),
+            data=json.dumps({'track_id': self.track_id}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        submission = Submission.objects.get(user=self.alice, round=self.round)
+        self.assertEqual(submission.isrc, 'APIISRC12345')
+        self.assertEqual(submission.title, 'API Verified Song')
+        self.assertEqual(submission.artist, 'API Artist')
+        self.assertEqual(submission.album, 'API Album')
+        self.assertEqual(submission.genres, ['rock'])
+        self.assertEqual(
+            response.json()['data']['submission_bonus_points'], 4,
+        )
+        player = next(
+            row.item for row in season_leaderboard(self.season)
+            if row.item.pk == self.alice.pk
+        )
+        self.assertEqual(player.submission_bonus, 4)
+        mocked_get.assert_called_once_with(f'/tracks/{self.track_id}')
+        mocked_broadcast.assert_called_once_with(
+            'submission_added', round_id=self.round.pk, submissions=1,
+        )
+
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_submission_api_repeats_rules_explicit_and_duplicate_validation(
+        self, mocked_get, _mocked_genres,
+    ):
+        url = reverse('api-v1:submission-create', args=[self.round.pk])
+        mocked_get.return_value = self.spotify_track(self.track_id)
+
+        rules_response = self.client.post(
+            url, data=json.dumps({'track_id': self.track_id}),
+            content_type='application/json',
+        )
+        self.assertEqual(
+            rules_response.json()['error']['code'],
+            'submission_rules_required',
+        )
+
+        self.accept_rules()
+        mocked_get.return_value = self.spotify_track(
+            self.track_id, explicit=True,
+        )
+        explicit_response = self.client.post(
+            url, data=json.dumps({'track_id': self.track_id}),
+            content_type='application/json',
+        )
+        self.assertEqual(explicit_response.json()['error']['code'], 'explicit_track')
+
+        existing = self.submission(self.bob, 'existing-api-track')
+        existing.isrc = 'APIISRC12345'
+        existing.save(update_fields=['isrc'])
+        mocked_get.return_value = self.spotify_track(self.track_id)
+        duplicate_response = self.client.post(
+            url, data=json.dumps({'track_id': self.track_id}),
+            content_type='application/json',
+        )
+        self.assertEqual(
+            duplicate_response.json()['error']['code'],
+            'duplicate_recording',
+        )
+        self.assertFalse(
+            Submission.objects.filter(user=self.alice, round=self.round).exists()
+        )
+
+    @patch('league.services.spotify_search.api_get')
+    def test_spotify_search_disables_same_isrc_but_not_same_track_id(
+        self, mocked_get,
+    ):
+        existing = self.submission(self.bob, self.track_id)
+        existing.isrc = 'EXISTINGISRC'
+        existing.save(update_fields=['isrc'])
+        search_url = reverse('api-v1:spotify-search')
+        mocked_get.side_effect = [
+            {'tracks': {'items': [self.spotify_track(
+                'YYYYYYYYYYYYYYYYYYYYYY', isrc='EXISTINGISRC',
+            )]}},
+            {'tracks': {'items': [self.spotify_track(
+                self.track_id, isrc='DIFFERENTISRC',
+            )]}},
+        ]
+
+        duplicate = self.client.get(search_url, {
+            'q': 'duplicate', 'round': self.round.pk,
+        }).json()['data']['tracks'][0]
+        different = self.client.get(search_url, {
+            'q': 'different', 'round': self.round.pk,
+        }).json()['data']['tracks'][0]
+
+        self.assertFalse(duplicate['available'])
+        self.assertTrue(duplicate['used'])
+        self.assertTrue(different['available'])
+        self.assertFalse(different['used'])
+
+    def test_submission_status_only_returns_current_users_song(self):
+        other = self.submission(self.bob, 'private-other-song')
+
+        empty = self.client.get(reverse(
+            'api-v1:submission-status', args=[self.round.pk],
+        )).json()['data']
+        self.assertIsNone(empty['submission'])
+        self.assertNotIn(other.title, json.dumps(empty))
+
+        mine = self.submission(self.alice, 'my-api-song')
+        status = self.client.get(reverse(
+            'api-v1:submission-status', args=[self.round.pk],
+        )).json()['data']
+        self.assertEqual(status['submission']['id'], mine.pk)
+        self.assertFalse(status['can_submit'])
+
+
+class VotingApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.own = self.submission(self.alice, 'api-vote-own')
+        self.bob_song = self.submission(self.bob, 'api-vote-bob')
+        self.cara_song = self.submission(self.cara, 'api-vote-cara')
+        self.client.force_login(self.alice)
+
+    def vote_url(self, submission):
+        return reverse(
+            'api-v1:vote-save', args=[self.round.pk, submission.pk],
+        )
+
+    @patch('league.api.voting_views.broadcast')
+    def test_incremental_vote_create_edit_and_realtime_parity(
+        self, mocked_broadcast,
+    ):
+        first = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 2}),
+            content_type='application/json',
+        )
+        vote = Vote.objects.get(voter=self.alice, submission=self.bob_song)
+        second = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 5}),
+            content_type='application/json',
+        )
+
+        vote.refresh_from_db()
+        self.assertEqual(Vote.objects.filter(
+            voter=self.alice, submission=self.bob_song,
+        ).count(), 1)
+        self.assertEqual(vote.score, 5)
+        self.assertTrue(first.json()['data']['vote']['created'])
+        self.assertFalse(second.json()['data']['vote']['created'])
+        self.assertEqual(second.json()['data']['vote']['id'], vote.pk)
+        self.assertEqual(mocked_broadcast.call_count, 2)
+        mocked_broadcast.assert_called_with(
+            'vote_saved', round_id=self.round.pk, votes=1,
+        )
+
+    def test_editing_one_rating_preserves_other_saved_ratings(self):
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=self.bob_song, score=2,
+        )
+        other = Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=self.cara_song, score=4,
+        )
+
+        response = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 5}),
+            content_type='application/json',
+        )
+
+        other.refresh_from_db()
+        saved = response.json()['data']['ballot']['saved_scores']
+        self.assertEqual(other.score, 4)
+        self.assertEqual(saved[str(self.bob_song.pk)], 5)
+        self.assertEqual(saved[str(self.cara_song.pk)], 4)
+        self.assertTrue(response.json()['data']['ballot']['complete'])
+
+    def test_self_vote_and_invalid_scores_are_rejected(self):
+        self_vote = self.client.post(
+            self.vote_url(self.own),
+            data=json.dumps({'score': 5}),
+            content_type='application/json',
+        )
+        invalid = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 6}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(self_vote.json()['error']['code'], 'self_vote')
+        self.assertEqual(invalid.json()['error']['code'], 'invalid_score')
+        self.assertFalse(Vote.objects.filter(voter=self.alice).exists())
+
+    def test_voting_phase_is_validated_server_side(self):
+        self.round.voting_deadline = timezone.now() - timedelta(minutes=1)
+        self.round.save(update_fields=['voting_deadline'])
+
+        response = self.client.post(
+            self.vote_url(self.bob_song),
+            data=json.dumps({'score': 4}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.json()['error']['code'], 'voting_closed')
+        self.assertFalse(Vote.objects.filter(voter=self.alice).exists())
+
+    def test_final_vote_marks_complete_and_ballot_read_returns_saved_scores(self):
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=self.bob_song, score=3,
+        )
+
+        mutation = self.client.post(
+            self.vote_url(self.cara_song),
+            data=json.dumps({'score': 4}),
+            content_type='application/json',
+        ).json()['data']
+        ballot = self.client.get(reverse(
+            'api-v1:ballot', args=[self.round.pk],
+        )).json()['data']
+
+        self.assertTrue(mutation['ballot']['complete'])
+        self.assertEqual(mutation['ballot']['voted_count'], 2)
+        self.assertTrue(ballot['complete'])
+        self.assertEqual(ballot['saved_scores'][str(self.bob_song.pk)], 3)
+        self.assertEqual(ballot['saved_scores'][str(self.cara_song.pk)], 4)
+
+
+class AccountApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.alice)
+
+    def test_profile_update_is_csrf_protected_and_updates_display_name(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+        blocked = client.post(
+            reverse('api-v1:profile-update'),
+            data=json.dumps({'display_name': 'Blocked'}),
+            content_type='application/json',
+        )
+        client.get(reverse('api-v1:session'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+        updated = client.post(
+            reverse('api-v1:profile-update'),
+            data=json.dumps({'display_name': 'API Alice'}),
+            content_type='application/json',
+            HTTP_X_CSRFTOKEN=token,
+        )
+
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(updated.status_code, 200)
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.first_name, 'API Alice')
+
+    def test_current_season_acknowledgement_is_idempotent_and_hides_html_prompt(self):
+        url = reverse('api-v1:season-welcome')
+
+        first = self.client.post(url)
+        second = self.client.post(url)
+
+        self.assertTrue(first.json()['data']['created'])
+        self.assertFalse(second.json()['data']['created'])
+        self.assertEqual(SeasonWelcome.objects.filter(
+            user=self.alice, season=self.season,
+        ).count(), 1)
+        self.assertIsNone(self.client.get(reverse('home')).context['season_welcome'])
+
+    def test_onboarding_guide_and_submission_rules_are_persistent(self):
+        guide = self.client.post(reverse('api-v1:voting-guide'))
+        rules = self.client.post(reverse('api-v1:submission-rules'))
+        state = self.client.get(reverse('api-v1:onboarding')).json()['data']
+
+        self.alice.profile.refresh_from_db()
+        self.assertTrue(guide.json()['data']['voting_guide_seen'])
+        self.assertTrue(rules.json()['data']['submission_rules_accepted'])
+        self.assertTrue(self.alice.profile.voting_guide_seen)
+        self.assertIsNotNone(self.alice.profile.submission_rules_accepted_at)
+        self.assertTrue(state['voting_guide_seen'])
+        self.assertTrue(state['submission_rules_accepted'])
+
+    def test_push_api_registers_multiple_devices_and_removes_only_target(self):
+        url = reverse('api-v1:push-subscriptions')
+        first = {
+            'endpoint': 'https://push.example/device-one',
+            'keys': {'p256dh': 'p1', 'auth': 'a1'},
+        }
+        second = {
+            'endpoint': 'https://push.example/device-two',
+            'keys': {'p256dh': 'p2', 'auth': 'a2'},
+        }
+
+        self.client.post(
+            url, data=json.dumps(first), content_type='application/json',
+        )
+        self.client.post(
+            url, data=json.dumps(second), content_type='application/json',
+        )
+        removed = self.client.delete(
+            url,
+            data=json.dumps({'endpoint': first['endpoint']}),
+            content_type='application/json',
+        )
+        preferences = self.client.get(
+            reverse('api-v1:notifications'),
+        ).json()['data']
+
+        self.assertTrue(removed.json()['data']['removed'])
+        self.assertTrue(preferences['push_enabled'])
+        self.assertEqual(
+            [row['endpoint'] for row in preferences['subscriptions']],
+            [second['endpoint']],
+        )
+
+    def test_api_picture_upload_and_removal_are_csrf_protected(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+        picture_url = reverse('api-v1:profile-picture')
+        blocked = client.post(picture_url, {
+            'picture': SimpleUploadedFile(
+                'blocked.png', ProfileUploadCsrfTests.png_bytes(),
+                content_type='image/png',
+            ),
+        })
+        client.get(reverse('api-v1:session'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+        uploaded = client.post(
+            picture_url,
+            {'picture': SimpleUploadedFile(
+                'api-picture.png', ProfileUploadCsrfTests.png_bytes(),
+                content_type='image/png',
+            )},
+            HTTP_X_CSRFTOKEN=token,
+        )
+        removed = client.delete(
+            picture_url, HTTP_X_CSRFTOKEN=token,
+        )
+
+        self.assertEqual(blocked.status_code, 403)
+        self.assertEqual(uploaded.status_code, 200)
+        self.assertTrue(uploaded.json()['data']['picture_url'].endswith('.png'))
+        self.assertTrue(removed.json()['data']['removed'])
+        self.alice.profile.refresh_from_db()
+        self.assertFalse(bool(self.alice.profile.picture))
+
+    def test_api_raw_picture_fallback_preserves_normalization(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.alice)
+        client.get(reverse('api-v1:session'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+
+        response = client.generic(
+            'POST', reverse('api-v1:profile-picture'),
+            ProfileUploadCsrfTests.jpeg_bytes(),
+            content_type='application/octet-stream',
+            HTTP_X_CSRFTOKEN=token,
+            HTTP_X_QUEUEUP_RAW_UPLOAD='1',
+            HTTP_X_QUEUEUP_FILENAME='iphone-photo.jpeg',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.alice.profile.refresh_from_db()
+        self.assertTrue(self.alice.profile.picture.name.endswith('.jpg'))
+        self.alice.profile.picture.delete(save=False)
+
+
+class StaffReadApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user('api-staff', password='x', is_staff=True)
+
+    def test_staff_reads_require_staff(self):
+        self.client.force_login(self.alice)
+        for name in ('staff-overview', 'staff-rounds', 'staff-players', 'staff-badges', 'staff-seasons'):
+            response = self.client.get(reverse(f'api-v1:{name}'))
+            self.assertEqual(response.status_code, 403)
+
+    def test_round_status_and_counts_preserve_authoritative_aggregates(self):
+        alice_song = self.submission(self.alice, 'staff-api-a')
+        bob_song = self.submission(self.bob, 'staff-api-b')
+        Vote.objects.create(round=self.round, voter=self.cara, submission=alice_song, score=3)
+        Vote.objects.create(round=self.round, voter=self.cara, submission=bob_song, score=4)
+        self.client.force_login(self.staff)
+
+        rounds = self.client.get(reverse('api-v1:staff-rounds')).json()['data']['rounds']
+        current = next(value for value in rounds if value['id'] == self.round.pk)
+        self.assertEqual(current['submission_count'], 2)
+        self.assertEqual(current['vote_count'], 2)
+        response = self.client.get(reverse('api-v1:staff-round-status', args=[self.round.pk]))
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertEqual(data['submitted_count'], 2)
+        self.assertEqual(data['completed_count'], 1)
+
+    def test_player_badge_and_round_search_match_control_pages(self):
+        Badge.objects.create(name='Needle Badge', slug='needle-badge', description='Found')
+        self.client.force_login(self.staff)
+        players = self.client.get(reverse('api-v1:staff-players'), {'q': 'alice'}).json()['data']['players']
+        badges = self.client.get(reverse('api-v1:staff-badges'), {'q': 'Needle'}).json()['data']['badges']
+        rounds = self.client.get(reverse('api-v1:staff-rounds'), {'q': self.round.prompt}).json()['data']['rounds']
+        self.assertEqual([value['username'] for value in players], ['alice'])
+        self.assertEqual([value['slug'] for value in badges], ['needle-badge'])
+        self.assertEqual([value['id'] for value in rounds], [self.round.pk])
+        self.assertContains(self.client.get(reverse('control_users'), {'q': 'alice'}), 'alice')
+
+
+class StaffCommandApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user('api-staff-cmd', password='x', is_staff=True)
+        self.client.force_login(self.staff)
+
+    def test_approve_user_via_api(self):
+        player = User.objects.create_user('pending-api', password='x')
+        response = self.client.post(
+            reverse('api-v1:staff-user-action', args=[player.pk]),
+            data=json.dumps({'action': 'approve'}),
+            content_type='application/json'
+        )
+        self.assertEqual(response.status_code, 200)
+        player.profile.refresh_from_db()
+        self.assertTrue(player.profile.approved)
+
+    def test_round_lifecycle_actions_via_api(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='API Lifecycle',
+            submission_opens=now + timedelta(days=1),
+            submission_deadline=now + timedelta(days=2),
+            voting_deadline=now + timedelta(days=3),
+            reveal_at=now + timedelta(days=4),
+        )
+        url = reverse('api-v1:staff-round-action', args=[rnd.pk])
+
+        response = self.client.post(url, data=json.dumps({'action': 'open_submissions'}), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        rnd.refresh_from_db()
+        self.assertEqual(rnd.state, 'submitting')
+
+        response = self.client.post(url, data=json.dumps({'action': 'open_voting'}), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        rnd.refresh_from_db()
+        self.assertEqual(rnd.state, 'voting')
+
+    def test_badge_award_via_api(self):
+        badge = Badge.objects.create(name='API Badge', slug='api-badge', description='Test')
+        url = reverse('api-v1:staff-badge-award', args=[badge.pk, self.alice.pk])
+
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(UserBadge.objects.filter(user=self.alice, badge=badge).exists())
+
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(UserBadge.objects.filter(user=self.alice, badge=badge).exists())
+
+    def test_self_protection_via_api(self):
+        url = reverse('api-v1:staff-user-action', args=[self.staff.pk])
+        response = self.client.post(url, data=json.dumps({'action': 'toggle_active'}), content_type='application/json')
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error']['code'], 'self_access_change_not_allowed')
+
+    def test_round_save_and_delete_via_api(self):
+        create_url = reverse('api-v1:staff-round-create')
+        data = {
+            'season': self.season.pk,
+            'prompt': 'API New Round',
+            'submission_opens': '2026-08-18T10:00:00',
+            'submission_deadline': '2026-08-20T10:00:00',
+            'voting_deadline': '2026-08-22T10:00:00',
+            'reveal_at': '2026-08-22T10:05:00',
+            'save_action': 'save',
+        }
+        response = self.client.post(create_url, data=json.dumps(data), content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        rnd_id = response.json()['data']['id']
+        self.assertTrue(Round.objects.filter(pk=rnd_id).exists())
+
+        delete_url = reverse('api-v1:staff-round-delete', args=[rnd_id])
+        response = self.client.delete(delete_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Round.objects.filter(pk=rnd_id).exists())
+
+
+class ApiPrivacyRegressionTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.alice)
+
+    def test_submitting_round_does_not_expose_other_songs_via_round_detail(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Submitting Round',
+            submission_opens=now - timedelta(days=1),
+            submission_deadline=now + timedelta(days=1),
+            voting_deadline=now + timedelta(days=3),
+            reveal_at=now + timedelta(days=4),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a',
+            spotify_uri='spotify:track:t-a', title='Alice Song', artist='Alice Artist',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b',
+            spotify_uri='spotify:track:t-b', title='Bob Song', artist='Bob Artist',
+        )
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('my_submission', data)
+        self.assertIsNotNone(data['my_submission'])
+        self.assertIn('ballot', data)
+        self.assertNotIn('eligible_submissions', data['ballot'])
+
+    def test_submitting_round_does_not_expose_other_songs_via_ballot(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Submitting Round 2',
+            submission_opens=now - timedelta(days=1),
+            submission_deadline=now + timedelta(days=1),
+            voting_deadline=now + timedelta(days=3),
+            reveal_at=now + timedelta(days=4),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a2',
+            spotify_uri='spotify:track:t-a2', title='Alice Song 2', artist='Alice Artist 2',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b2',
+            spotify_uri='spotify:track:t-b2', title='Bob Song 2', artist='Bob Artist 2',
+        )
+        url = reverse('api-v1:ballot', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertNotIn('eligible_submissions', data)
+
+    def test_locked_round_does_not_expose_other_songs_via_round_detail(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Locked Round',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now - timedelta(hours=1),
+            reveal_at=now + timedelta(days=1),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a3',
+            spotify_uri='spotify:track:t-a3', title='Alice Song 3', artist='Alice Artist 3',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b3',
+            spotify_uri='spotify:track:t-b3', title='Bob Song 3', artist='Bob Artist 3',
+        )
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('ballot', data)
+        self.assertNotIn('eligible_submissions', data['ballot'])
+
+    def test_locked_round_does_not_expose_other_songs_via_ballot(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Locked Round 2',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now - timedelta(hours=1),
+            reveal_at=now + timedelta(days=1),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a4',
+            spotify_uri='spotify:track:t-a4', title='Alice Song 4', artist='Alice Artist 4',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b4',
+            spotify_uri='spotify:track:t-b4', title='Bob Song 4', artist='Bob Artist 4',
+        )
+        url = reverse('api-v1:ballot', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertNotIn('eligible_submissions', data)
+
+    def test_voting_round_exposes_anonymous_eligible_songs_and_saved_ratings(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Voting Round',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now + timedelta(days=1),
+            reveal_at=now + timedelta(days=2),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a5',
+            spotify_uri='spotify:track:t-a5', title='Alice Song 5', artist='Alice Artist 5',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b5',
+            spotify_uri='spotify:track:t-b5', title='Bob Song 5', artist='Bob Artist 5',
+        )
+        Vote.objects.create(round=rnd, voter=self.alice, submission=bob_sub, score=4)
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('ballot', data)
+        self.assertIn('eligible_submissions', data['ballot'])
+        self.assertEqual(len(data['ballot']['eligible_submissions']), 1)
+        sub = data['ballot']['eligible_submissions'][0]
+        self.assertEqual(sub['id'], bob_sub.pk)
+        self.assertEqual(data['ballot']['saved_scores'].get(str(bob_sub.pk)), 4)
+
+    def test_voting_round_ballot_endpoint_exposes_eligible_songs(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Voting Round 2',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now + timedelta(days=1),
+            reveal_at=now + timedelta(days=2),
+        )
+        alice_sub = Submission.objects.create(
+            round=rnd, user=self.alice, spotify_track_id='t-a6',
+            spotify_uri='spotify:track:t-a6', title='Alice Song 6', artist='Alice Artist 6',
+        )
+        bob_sub = Submission.objects.create(
+            round=rnd, user=self.bob, spotify_track_id='t-b6',
+            spotify_uri='spotify:track:t-b6', title='Bob Song 6', artist='Bob Artist 6',
+        )
+        url = reverse('api-v1:ballot', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('eligible_submissions', data)
+        self.assertEqual(len(data['eligible_submissions']), 1)
+
+    def test_playlist_url_not_exposed_before_reveal(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Playlist Test',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now + timedelta(hours=1),
+            reveal_at=now + timedelta(days=1),
+            playlist_url='https://open.spotify.com/playlist/test',
+        )
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('round', data)
+        self.assertNotIn('playlist_url', data['round'])
+
+    def test_playlist_url_exposed_after_reveal(self):
+        now = timezone.now()
+        rnd = Round.objects.create(
+            season=self.season, prompt='Playlist Test Revealed',
+            submission_opens=now - timedelta(days=3),
+            submission_deadline=now - timedelta(days=2),
+            voting_deadline=now - timedelta(days=1),
+            reveal_at=now - timedelta(hours=1),
+            playlist_url='https://open.spotify.com/playlist/test-revealed',
+        )
+        url = reverse('api-v1:round-detail', args=[rnd.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('round', data)
+        self.assertEqual(data['round']['playlist_url'], 'https://open.spotify.com/playlist/test-revealed')
+
+    def test_pending_user_can_access_onboarding_state(self):
+        pending = User.objects.create_user('pending-test', password='x')
+        self.client.force_login(pending)
+        url = reverse('api-v1:onboarding')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()['data']
+        self.assertIn('season_welcome', data)
+        self.assertIn('voting_guide_seen', data)
+        self.assertIn('submission_rules_accepted', data)
+
+    def test_pending_user_cannot_access_protected_player_endpoints(self):
+        pending = User.objects.create_user('pending-test2', password='x')
+        self.client.force_login(pending)
+        url = reverse('api-v1:dashboard')
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 403)
 
 
 class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
@@ -86,6 +1181,81 @@ class SeasonWelcomeTests(QueueUpTestMixin, TestCase):
 
 
 class VotingTests(QueueUpTestMixin, TestCase):
+    @patch('league.views.broadcast')
+    def test_first_rating_creates_one_vote_and_preserves_realtime_event(
+        self, mocked_broadcast,
+    ):
+        self.submission(self.alice, 'own-first-vote')
+        bob_song = self.submission(self.bob, 'bob-first-vote')
+        self.client.force_login(self.alice)
+
+        response = self.client.post(
+            reverse('vote', args=[self.round.pk, bob_song.pk]),
+            {'score': 4},
+        )
+
+        self.assertRedirects(
+            response,
+            reverse('round_detail', args=[self.round.pk]),
+            fetch_redirect_response=False,
+        )
+        votes = Vote.objects.filter(voter=self.alice, submission=bob_song)
+        self.assertEqual(votes.count(), 1)
+        self.assertEqual(votes.get().score, 4)
+        mocked_broadcast.assert_called_once_with(
+            'vote_saved',
+            round_id=self.round.id,
+            votes=1,
+        )
+
+    def test_ballot_excludes_voters_own_submission(self):
+        own = self.submission(self.alice, 'own-ineligible')
+        bob_song = self.submission(self.bob, 'bob-eligible')
+        cara_song = self.submission(self.cara, 'cara-eligible')
+
+        ballot = ballot_for_user(self.round, self.alice)
+
+        self.assertEqual(ballot.eligible_ids, {bob_song.id, cara_song.id})
+        self.assertNotIn(own.id, ballot.eligible_ids)
+        self.assertEqual(ballot.eligible_count, 2)
+
+    def test_vote_endpoint_rejects_voters_own_submission(self):
+        own = self.submission(self.alice, 'own-blocked')
+        self.client.force_login(self.alice)
+
+        response = self.client.post(
+            reverse('vote', args=[self.round.pk, own.pk]),
+            {'score': 5},
+            follow=True,
+        )
+
+        self.assertContains(response, 'vote for your own song')
+        self.assertFalse(Vote.objects.filter(voter=self.alice, submission=own).exists())
+
+    def test_ballot_progress_tracks_saved_votes_and_completion(self):
+        self.submission(self.alice, 'own-progress')
+        bob_song = self.submission(self.bob, 'bob-progress')
+        cara_song = self.submission(self.cara, 'cara-progress')
+        Vote.objects.create(
+            round=self.round, voter=self.alice, submission=bob_song, score=3,
+        )
+
+        partial = ballot_for_user(self.round, self.alice)
+
+        self.assertEqual(partial.voted_ids, {bob_song.id})
+        self.assertEqual(partial.voted_count, 1)
+        self.assertEqual(partial.eligible_count, 2)
+        self.assertFalse(partial.complete)
+
+        Vote.objects.create(
+            round=self.round, voter=self.alice, submission=cara_song, score=4,
+        )
+
+        complete = ballot_for_user(self.round, self.alice)
+        self.assertEqual(complete.voted_ids, {bob_song.id, cara_song.id})
+        self.assertEqual(complete.voted_count, 2)
+        self.assertTrue(complete.complete)
+
     def test_completion_after_final_required_vote_and_on_revisit(self):
         own = self.submission(self.alice, 'own')
         bob_song = self.submission(self.bob, 'bob')
@@ -112,6 +1282,37 @@ class VotingTests(QueueUpTestMixin, TestCase):
         self.assertTrue(response.json()['complete'])
         self.assertTrue(Vote.objects.filter(voter=self.alice, submission=bob_song, score=5).exists())
 
+    def test_ajax_progress_increments_and_final_vote_completes_ballot(self):
+        self.submission(self.alice, 'own-progress-ajax')
+        bob_song = self.submission(self.bob, 'bob-progress-ajax')
+        cara_song = self.submission(self.cara, 'cara-progress-ajax')
+        self.client.force_login(self.alice)
+
+        partial = self.client.post(
+            reverse('vote', args=[self.round.pk, bob_song.pk]),
+            {'score': 3},
+            HTTP_X_REQUESTED_WITH='XMLHttpRequest',
+        )
+
+        self.assertEqual(partial.status_code, 200)
+        self.assertEqual(partial.json()['voted_count'], 1)
+        self.assertEqual(partial.json()['eligible_count'], 2)
+        self.assertFalse(partial.json()['complete'])
+
+        complete = self.client.post(
+            reverse('vote', args=[self.round.pk, cara_song.pk]),
+            {'score': 5},
+            HTTP_X_REQUESTED_WITH='XMLHttpRequest',
+        )
+
+        self.assertEqual(complete.status_code, 200)
+        self.assertEqual(complete.json()['voted_count'], 2)
+        self.assertEqual(complete.json()['eligible_count'], 2)
+        self.assertTrue(complete.json()['complete'])
+        revisit = self.client.get(reverse('round_detail', args=[self.round.pk]))
+        self.assertTrue(revisit.context['voting_complete'])
+        self.assertContains(revisit, "You're all caught up!")
+
     def test_review_page_loads_previously_saved_scores(self):
         self.submission(self.alice, 'own-review')
         bob_song = self.submission(self.bob, 'bob-review')
@@ -123,6 +1324,10 @@ class VotingTests(QueueUpTestMixin, TestCase):
         response = self.client.get(reverse('round_detail', args=[self.round.pk]) + '?review=1')
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.context['vote_scores'],
+            {bob_song.id: 2, cara_song.id: 5},
+        )
         self.assertContains(response, 'name="score" value="2"', count=1)
         self.assertContains(response, 'name="score" value="5"', count=1)
 
@@ -130,7 +1335,9 @@ class VotingTests(QueueUpTestMixin, TestCase):
         self.submission(self.alice, 'own-edit')
         bob_song = self.submission(self.bob, 'bob-edit')
         cara_song = self.submission(self.cara, 'cara-edit')
-        Vote.objects.create(round=self.round, voter=self.alice, submission=bob_song, score=2)
+        bob_vote = Vote.objects.create(
+            round=self.round, voter=self.alice, submission=bob_song, score=2,
+        )
         Vote.objects.create(round=self.round, voter=self.alice, submission=cara_song, score=5)
 
         self.client.force_login(self.alice)
@@ -141,8 +1348,58 @@ class VotingTests(QueueUpTestMixin, TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(Vote.objects.get(voter=self.alice, submission=bob_song).score, 4)
+        updated = Vote.objects.get(voter=self.alice, submission=bob_song)
+        self.assertEqual(updated.pk, bob_vote.pk)
+        self.assertEqual(updated.score, 4)
         self.assertEqual(Vote.objects.get(voter=self.alice, submission=cara_song).score, 5)
+        self.assertEqual(Vote.objects.filter(voter=self.alice).count(), 2)
+
+    @patch('league.views.broadcast')
+    def test_invalid_score_is_rejected_without_mutation_or_broadcast(
+        self, mocked_broadcast,
+    ):
+        bob_song = self.submission(self.bob, 'bob-invalid-score')
+        self.client.force_login(self.alice)
+
+        response = self.client.post(
+            reverse('vote', args=[self.round.pk, bob_song.pk]),
+            {'score': 6},
+        )
+
+        self.assertRedirects(
+            response,
+            reverse('round_detail', args=[self.round.pk]),
+            fetch_redirect_response=False,
+        )
+        self.assertFalse(
+            Vote.objects.filter(voter=self.alice, submission=bob_song).exists()
+        )
+        mocked_broadcast.assert_not_called()
+        with self.assertRaises(vote_service.InvalidVoteScore):
+            vote_service.record_vote(self.round, self.alice, bob_song, 6)
+
+    @patch('league.views.broadcast')
+    def test_voting_outside_permitted_phase_is_rejected(
+        self, mocked_broadcast,
+    ):
+        bob_song = self.submission(self.bob, 'bob-closed-voting')
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+        self.client.force_login(self.alice)
+
+        response = self.client.post(
+            reverse('vote', args=[self.round.pk, bob_song.pk]),
+            {'score': 4},
+            follow=True,
+        )
+
+        self.assertContains(response, 'Voting is not open.')
+        self.assertFalse(
+            Vote.objects.filter(voter=self.alice, submission=bob_song).exists()
+        )
+        mocked_broadcast.assert_not_called()
 
     def test_changed_rating_keeps_completion(self):
         self.submission(self.alice, 'own')
@@ -152,6 +1409,11 @@ class VotingTests(QueueUpTestMixin, TestCase):
         response = self.client.post(reverse('vote', args=[self.round.pk, bob_song.pk]), {'score': 4}, HTTP_X_REQUESTED_WITH='XMLHttpRequest')
         self.assertTrue(response.json()['complete'])
         self.assertEqual(Vote.objects.get(voter=self.alice, submission=bob_song).score, 4)
+        review = self.client.get(
+            reverse('round_detail', args=[self.round.pk]) + '?review=1'
+        )
+        self.assertEqual(review.context['vote_scores'][bob_song.id], 4)
+        self.assertContains(review, 'name="score" value="4"', count=1)
 
 
 class RankingTests(QueueUpTestMixin, TestCase):
@@ -208,6 +1470,222 @@ class RankingTests(QueueUpTestMixin, TestCase):
         self.assertEqual(ranked[alice_song.id].avg, 2)
 
 
+class ProfileReadServiceTests(QueueUpTestMixin, TestCase):
+    def test_profile_scores_exclude_an_incomplete_ballot_after_close(self):
+        alice_song = self.submission(self.alice, 'profile-alice')
+        bob_song = self.submission(self.bob, 'profile-bob')
+        self.submission(self.cara, 'profile-cara')
+
+        # Bob's single rating is an incomplete ballot and must not contribute.
+        Vote.objects.create(
+            round=self.round,
+            voter=self.bob,
+            submission=alice_song,
+            score=1,
+        )
+        # Cara completes both ratings she is eligible to cast.
+        Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=alice_song,
+            score=5,
+        )
+        Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=bob_song,
+            score=4,
+        )
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+
+        metrics = service_profile_metrics(self.alice, now=now)
+        submission = metrics.revealed.get(pk=alice_song.pk)
+        profile = profile_for_user(self.alice, now=now)
+
+        self.assertEqual(submission.vote_count, 1)
+        self.assertEqual(submission.avg, 5)
+        self.assertEqual(profile.avg_received, 5)
+        self.assertEqual(profile.round_count, 1)
+        self.assertEqual(list(profile.seasons), [self.season])
+
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('stats'))
+        self.assertEqual(response.context['avg_received'], 5)
+        self.assertContains(response, 'profile-alice')
+
+    def test_legacy_profile_metrics_contract_remains_available(self):
+        from .achievements import profile_metrics
+
+        metrics = profile_metrics(self.alice)
+
+        self.assertEqual(
+            set(metrics),
+            {
+                'submissions', 'revealed', 'wins', 'podiums', 'placements',
+                'ties_for_first', 'counted_vote_ids',
+            },
+        )
+
+
+class SeasonLeaderboardScoringTests(QueueUpTestMixin, TestCase):
+    def leaderboard_entry(self, user):
+        return next(
+            entry
+            for entry in season_leaderboard(self.season)
+            if entry.item.pk == user.pk
+        )
+
+    def create_revealed_round(self, prompt):
+        now = timezone.now()
+        return Round.objects.create(
+            season=self.season,
+            prompt=prompt,
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+
+    @staticmethod
+    def create_submission(round_obj, user, track):
+        return Submission.objects.create(
+            round=round_obj,
+            user=user,
+            spotify_track_id=track,
+            spotify_uri=f'spotify:track:{track}',
+            spotify_url=f'https://open.spotify.com/track/{track}',
+            title=track,
+            artist='Artist',
+        )
+
+    def reveal_current_round(self):
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+
+    def test_submission_bonus_is_added_immediately(self):
+        self.submission(self.alice, 'bonus-now')
+
+        player = self.leaderboard_entry(self.alice).item
+
+        self.assertEqual(SUBMISSION_BONUS_POINTS, 4)
+        self.assertEqual(player.submission_bonus, 4)
+        self.assertEqual(player.total_score, 4)
+
+    def test_deleting_submission_removes_its_bonus(self):
+        first = self.submission(self.alice, 'bonus-first')
+        other_round = self.create_revealed_round('Other round')
+        second = self.create_submission(
+            other_round,
+            self.alice,
+            'bonus-second',
+        )
+        self.assertEqual(
+            self.leaderboard_entry(self.alice).item.submission_bonus,
+            8,
+        )
+
+        second.delete()
+
+        player = self.leaderboard_entry(self.alice).item
+        self.assertEqual(player.submission_bonus, 4)
+        self.assertEqual(player.rounds_played, 1)
+        self.assertTrue(Submission.objects.filter(pk=first.pk).exists())
+
+    def test_replacing_submission_restores_bonus(self):
+        original = self.submission(self.alice, 'bonus-original')
+        original.delete()
+        self.assertFalse(any(
+            entry.item.pk == self.alice.pk
+            for entry in season_leaderboard(self.season)
+        ))
+
+        self.submission(self.alice, 'bonus-replacement')
+
+        player = self.leaderboard_entry(self.alice).item
+        self.assertEqual(player.submission_bonus, 4)
+        self.assertEqual(player.total_score, 4)
+
+    def test_incomplete_ballot_is_excluded_from_leaderboard(self):
+        alice_song = self.submission(self.alice, 'score-alice')
+        bob_song = self.submission(self.bob, 'score-bob')
+        cara_song = self.submission(self.cara, 'score-cara')
+        Vote.objects.create(
+            round=self.round,
+            voter=self.alice,
+            submission=bob_song,
+            score=4,
+        )
+        Vote.objects.create(
+            round=self.round,
+            voter=self.alice,
+            submission=cara_song,
+            score=4,
+        )
+        Vote.objects.create(
+            round=self.round,
+            voter=self.bob,
+            submission=alice_song,
+            score=5,
+        )
+        self.reveal_current_round()
+
+        players = {
+            entry.item.pk: entry.item
+            for entry in season_leaderboard(self.season)
+        }
+
+        self.assertIsNone(players[self.alice.pk].vote_score)
+        self.assertEqual(players[self.alice.pk].total_score, 4)
+        self.assertEqual(players[self.bob.pk].total_score, 8)
+        self.assertEqual(players[self.cara.pk].total_score, 8)
+
+    def test_equal_scores_receive_tied_competition_rank(self):
+        alice_song = self.submission(self.alice, 'tie-alice')
+        bob_song = self.submission(self.bob, 'tie-bob')
+        Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=alice_song,
+            score=5,
+        )
+        Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=bob_song,
+            score=5,
+        )
+        self.reveal_current_round()
+
+        leaderboard = season_leaderboard(self.season)
+
+        self.assertEqual([entry.place for entry in leaderboard], [1, 1])
+        self.assertTrue(all(entry.tied for entry in leaderboard))
+        self.assertEqual([entry.item.total_score for entry in leaderboard], [9, 9])
+
+    def test_archived_round_remains_in_leaderboard(self):
+        alice_song = self.submission(self.alice, 'archived-alice')
+        Vote.objects.create(
+            round=self.round,
+            voter=self.bob,
+            submission=alice_song,
+            score=5,
+        )
+        self.reveal_current_round()
+        self.round.archived = True
+        self.round.save(update_fields=['archived'])
+
+        player = self.leaderboard_entry(self.alice).item
+
+        self.assertEqual(player.vote_score, 5)
+        self.assertEqual(player.submission_bonus, 4)
+        self.assertEqual(player.total_score, 9)
+
+
 class HomeRoundVisibilityTests(QueueUpTestMixin, TestCase):
     def test_latest_results_stay_above_new_live_round(self):
         now = timezone.now()
@@ -233,6 +1711,7 @@ class HomeRoundVisibilityTests(QueueUpTestMixin, TestCase):
 
         self.assertEqual(response.context['results_round'], self.round)
         self.assertEqual(response.context['round'], new_round)
+        self.assertFalse(response.context['current_first'])
         self.assertContains(response, 'Finished prompt')
         self.assertContains(response, 'New live prompt')
         self.assertLess(
@@ -285,6 +1764,113 @@ class HomeRoundVisibilityTests(QueueUpTestMixin, TestCase):
         self.assertIsNone(home_response.context['results_round'])
         self.assertNotContains(home_response, self.round.prompt)
         self.assertContains(archive_response, self.round.prompt)
+        self.assertEqual(list(archive_response.context['rounds']), [self.round])
+
+    def test_newest_active_round_is_selected(self):
+        now = timezone.now()
+        self.round.prompt = 'Older active prompt'
+        self.round.save(update_fields=['prompt'])
+        newer_round = Round.objects.create(
+            season=self.season,
+            prompt='Newest active prompt',
+            goes_live_at=now - timedelta(hours=2),
+            submission_opens=now - timedelta(hours=1),
+            submission_deadline=now + timedelta(days=1),
+            voting_deadline=now + timedelta(days=2),
+            reveal_at=now + timedelta(days=3),
+        )
+
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('home'))
+
+        self.assertEqual(response.context['round'], newer_round)
+        self.assertContains(response, 'Newest active prompt')
+        self.assertNotContains(response, 'Older active prompt')
+
+    def test_most_recent_revealed_round_is_selected_for_results(self):
+        now = timezone.now()
+        self.round.prompt = 'Older results prompt'
+        self.round.submission_opens = now - timedelta(days=6)
+        self.round.submission_deadline = now - timedelta(days=5)
+        self.round.voting_deadline = now - timedelta(days=4)
+        self.round.reveal_at = now - timedelta(days=3)
+        self.round.save()
+        newer_results = Round.objects.create(
+            season=self.season,
+            prompt='Newest results prompt',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(hours=1),
+        )
+
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('home'))
+
+        self.assertIsNone(response.context['round'])
+        self.assertEqual(response.context['results_round'], newer_results)
+        self.assertContains(response, 'Newest results prompt')
+        self.assertNotContains(response, 'Older results prompt')
+
+    def test_archive_includes_all_revealed_rounds_in_reverse_reveal_order(self):
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(days=6)
+        self.round.submission_deadline = now - timedelta(days=5)
+        self.round.voting_deadline = now - timedelta(days=4)
+        self.round.reveal_at = now - timedelta(days=3)
+        self.round.save()
+        newer_archived = Round.objects.create(
+            season=self.season,
+            prompt='Newer archived result',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(hours=1),
+            archived=True,
+        )
+
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('archive'))
+
+        self.assertEqual(
+            list(response.context['rounds']),
+            [newer_archived, self.round],
+        )
+
+    def test_hidden_and_draft_rounds_stay_off_home_and_archive(self):
+        now = timezone.now()
+        self.round.prompt = 'Hidden upcoming prompt'
+        self.round.goes_live_at = now + timedelta(days=1)
+        self.round.save(update_fields=['prompt', 'goes_live_at'])
+        hidden_results = Round.objects.create(
+            season=self.season,
+            prompt='Hidden results prompt',
+            goes_live_at=now + timedelta(days=1),
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+        draft_results = Round.objects.create(
+            season=self.season,
+            prompt='Draft results prompt',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+            is_draft=True,
+        )
+
+        self.client.force_login(self.alice)
+        home_response = self.client.get(reverse('home'))
+        archive_response = self.client.get(reverse('archive'))
+
+        self.assertIsNone(home_response.context['round'])
+        self.assertIsNone(home_response.context['results_round'])
+        self.assertEqual(list(archive_response.context['rounds']), [])
+        for rnd in (self.round, hidden_results, draft_results):
+            self.assertNotContains(home_response, rnd.prompt)
+            self.assertNotContains(archive_response, rnd.prompt)
 
     def test_staff_can_archive_completed_round(self):
         now = timezone.now()
@@ -355,9 +1941,153 @@ class NotificationTests(QueueUpTestMixin, TestCase):
     def test_command_is_idempotent_per_device_event(self, mocked_push):
         call_command('send_round_notifications')
         first = mocked_push.call_count
+        delivered_keys = set(
+            NotificationDelivery.objects.values_list('event_key', flat=True)
+        )
         call_command('send_round_notifications')
         self.assertEqual(mocked_push.call_count, first)
         self.assertEqual(NotificationDelivery.objects.count(), first)
+        self.assertEqual(delivered_keys, {f'round:{self.round.pk}:live'})
+
+    def test_submission_reminder_event_keeps_audience_key_and_payload(self):
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(days=1)
+        self.round.submission_deadline = now + timedelta(hours=5)
+        self.round.save()
+        self.submission(self.alice, 'own')
+
+        event = next(
+            event for event in round_notification_events(self.round, now)
+            if event.event_key.endswith(':submission-reminder-6h')
+        )
+
+        self.assertEqual(
+            list(event.subscriptions.values_list('endpoint', flat=True)),
+            ['https://push/b1'],
+        )
+        self.assertEqual(
+            event.event_key,
+            f'round:{self.round.pk}:submission-reminder-6h',
+        )
+        self.assertEqual(event.title, '6 hours left to submit')
+        self.assertEqual(
+            event.body,
+            'Choose a clean song for “Prompt” before submissions close.',
+        )
+        self.assertEqual(event.url, f'/round/{self.round.pk}/')
+
+    def test_reminders_keep_existing_six_hour_selection_window(self):
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(days=1)
+        self.round.submission_deadline = now + timedelta(hours=6)
+        self.round.voting_deadline = now + timedelta(days=1)
+        self.round.save()
+
+        at_boundary = {
+            event.event_key for event in round_notification_events(
+                self.round, now,
+            )
+        }
+        before_boundary = {
+            event.event_key for event in round_notification_events(
+                self.round, now - timedelta(seconds=1),
+            )
+        }
+
+        reminder_key = f'round:{self.round.pk}:submission-reminder-6h'
+        self.assertIn(reminder_key, at_boundary)
+        self.assertNotIn(reminder_key, before_boundary)
+
+    def test_submission_reminder_audience_excludes_existing_submitters(self):
+        self.submission(self.alice, 'own')
+
+        endpoints = submission_reminder_audience(self.round).values_list(
+            'endpoint', flat=True,
+        )
+
+        self.assertEqual(list(endpoints), ['https://push/b1'])
+
+    def test_voting_reminder_uses_complete_ballot_semantics(self):
+        alice_song = self.submission(self.alice, 'alice-song')
+        bob_song = self.submission(self.bob, 'bob-song')
+        cara_song = self.submission(self.cara, 'cara-song')
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=bob_song, score=5,
+        )
+        Vote.objects.create(
+            round=self.round, voter=self.alice,
+            submission=cara_song, score=4,
+        )
+        Vote.objects.create(
+            round=self.round, voter=self.bob,
+            submission=alice_song, score=3,
+        )
+
+        audience = voting_reminder_audience(self.round)
+
+        self.assertEqual(
+            list(audience.values_list('endpoint', flat=True)),
+            ['https://push/b1'],
+        )
+
+    def test_voting_reminder_event_keeps_key_and_payload(self):
+        now = timezone.now()
+        self.submission(self.alice, 'alice-song')
+        self.submission(self.bob, 'bob-song')
+        self.round.submission_deadline = now - timedelta(hours=1)
+        self.round.voting_deadline = now + timedelta(hours=5)
+        self.round.save()
+
+        event = next(
+            event for event in round_notification_events(self.round, now)
+            if event.event_key.endswith(':voting-reminder-6h')
+        )
+
+        self.assertEqual(
+            event.event_key,
+            f'round:{self.round.pk}:voting-reminder-6h',
+        )
+        self.assertEqual(event.title, '6 hours left to vote')
+        self.assertEqual(
+            event.body,
+            'Finish rating the songs for “Prompt”.',
+        )
+        self.assertEqual(event.url, f'/round/{self.round.pk}/')
+
+    def test_results_event_keeps_global_audience_key_and_payload(self):
+        now = timezone.now()
+        self.round.reveal_at = now - timedelta(minutes=1)
+        self.round.save(update_fields=['reveal_at'])
+
+        event = next(
+            event for event in round_notification_events(self.round, now)
+            if event.event_key.endswith(':results')
+        )
+
+        self.assertEqual(
+            set(event.subscriptions.values_list('endpoint', flat=True)),
+            {'https://push/a1', 'https://push/a2', 'https://push/b1'},
+        )
+        self.assertEqual(event.event_key, f'round:{self.round.pk}:results')
+        self.assertEqual(event.title, 'Results ready')
+        self.assertEqual(event.body, 'See who won “Prompt”.')
+        self.assertEqual(event.url, f'/round/{self.round.pk}/')
+
+    def test_achievement_event_keeps_audience_key_and_payload(self):
+        self.submission(self.alice, 'first-pick')
+
+        events = [
+            event for event in achievement_notification_events()
+            if event.user == self.alice and event.body == 'Submit your first song'
+        ]
+
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        unlock = AchievementUnlock.objects.get(user=self.alice, key='first_pick')
+        self.assertEqual(event.event_key, f'achievement:{unlock.pk}')
+        self.assertEqual(event.title, 'Badge unlocked')
+        self.assertEqual(event.url, '/stats/alice/')
 
     @patch('league.push.webpush')
     def test_submitter_not_sent_submission_reminder(self, mocked_push):
@@ -385,6 +2115,20 @@ class NotificationTests(QueueUpTestMixin, TestCase):
         self.assertNotIn('https://push/a1', endpoints)
         self.assertNotIn('https://push/a2', endpoints)
 
+    @patch('league.push.webpush')
+    def test_each_subscribed_device_receives_an_event_once(self, mocked_push):
+        call_command('send_round_notifications')
+
+        live_calls = [
+            call for call in mocked_push.call_args_list
+            if f'round:{self.round.pk}:live' in call.kwargs['data']
+        ]
+        self.assertEqual(
+            {call.kwargs['subscription_info']['endpoint'] for call in live_calls},
+            {'https://push/a1', 'https://push/a2', 'https://push/b1'},
+        )
+        self.assertEqual(len(live_calls), 3)
+
 
 class V70MembershipTests(TestCase):
     def test_new_signup_waits_for_approval(self):
@@ -399,7 +2143,8 @@ class V70MembershipTests(TestCase):
         self.assertRedirects(self.client.get(reverse('home')), reverse('waiting_approval'))
         self.assertEqual(self.client.get(reverse('notification_settings')).status_code, 200)
 
-    def test_staff_can_approve_user(self):
+    @patch('league.views.send_user_push')
+    def test_staff_can_approve_user_and_push_only_once(self, mocked_push):
         staff = User.objects.create_user('staff', password='x', is_staff=True)
         player = User.objects.create_user('pending', password='x')
         self.client.force_login(staff)
@@ -408,6 +2153,195 @@ class V70MembershipTests(TestCase):
         player.profile.refresh_from_db()
         self.assertTrue(player.profile.approved)
         self.assertIsNotNone(player.profile.approved_at)
+        approved_at = player.profile.approved_at
+        mocked_push.assert_called_once_with(
+            player,
+            f'user:{player.pk}:approved',
+            'You’re approved!',
+            'Your QueueUp account is ready. Tap to enter the league.',
+            '/home/',
+        )
+
+        self.client.post(reverse('user_action', args=[player.pk, 'approve']))
+
+        player.profile.refresh_from_db()
+        self.assertEqual(player.profile.approved_at, approved_at)
+        mocked_push.assert_called_once()
+
+    def test_staff_can_deactivate_and_reactivate_user(self):
+        staff = User.objects.create_user('active-staff', password='x', is_staff=True)
+        player = User.objects.create_user('active-player', password='x')
+        self.client.force_login(staff)
+        action_url = reverse('user_action', args=[player.pk, 'toggle_active'])
+
+        first = self.client.post(action_url)
+        player.refresh_from_db()
+        self.assertRedirects(first, reverse('control_users'))
+        self.assertFalse(player.is_active)
+
+        second = self.client.post(action_url)
+        player.refresh_from_db()
+        self.assertRedirects(second, reverse('control_users'))
+        self.assertTrue(player.is_active)
+
+    @patch('league.views.send_user_push')
+    def test_staff_flag_toggle_preserves_automatic_approval_behavior(
+        self, mocked_push,
+    ):
+        staff = User.objects.create_user('staff-manager', password='x', is_staff=True)
+        player = User.objects.create_user('future-staff', password='x')
+        self.client.force_login(staff)
+        action_url = reverse('user_action', args=[player.pk, 'toggle_staff'])
+
+        self.client.post(action_url)
+
+        player.refresh_from_db()
+        player.profile.refresh_from_db()
+        self.assertTrue(player.is_staff)
+        self.assertTrue(player.profile.approved)
+        self.assertIsNotNone(player.profile.approved_at)
+        mocked_push.assert_not_called()
+
+        self.client.post(action_url)
+        player.refresh_from_db()
+        self.assertFalse(player.is_staff)
+        self.assertTrue(player.profile.approved)
+
+    def test_self_protection_actions_leave_staff_access_unchanged(self):
+        staff = User.objects.create_user('protected-staff', password='x', is_staff=True)
+        self.client.force_login(staff)
+
+        for action in ('toggle_active', 'toggle_staff'):
+            response = self.client.post(
+                reverse('user_action', args=[staff.pk, action]),
+                follow=True,
+            )
+            self.assertContains(response, 'You cannot remove your own access.')
+
+        staff.refresh_from_db()
+        self.assertTrue(staff.is_active)
+        self.assertTrue(staff.is_staff)
+
+    def test_players_search_still_filters_name_username_and_email(self):
+        staff = User.objects.create_user('search-staff', password='x', is_staff=True)
+        match = User.objects.create_user(
+            'membership-match',
+            first_name='Needle Name',
+            email='needle@example.com',
+            password='x',
+        )
+        other = User.objects.create_user('membership-other', password='x')
+        self.client.force_login(staff)
+
+        response = self.client.get(reverse('control_users'), {'q': 'needle'})
+
+        self.assertEqual(list(response.context['users']), [match])
+        self.assertContains(response, match.username)
+        self.assertNotContains(response, other.username)
+
+
+class MembershipAndBadgeCommandTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user(
+            'badge-staff', password='x', is_staff=True,
+        )
+        self.manual_badge = Badge.objects.create(
+            name='Manual Honor',
+            slug='manual-honor',
+            description='Awarded manually.',
+            icon='◆',
+        )
+
+    def test_manual_badge_can_be_awarded_and_removed(self):
+        from .services.achievements import earned_badges, prestige_badges
+
+        self.client.force_login(self.staff)
+        url = reverse(
+            'badge_award', args=[self.manual_badge.pk, self.alice.pk],
+        )
+
+        awarded_response = self.client.post(url, follow=True)
+
+        award = UserBadge.objects.get(user=self.alice, badge=self.manual_badge)
+        self.assertEqual(award.awarded_by, self.staff)
+        self.assertContains(awarded_response, 'Awarded Manual Honor to alice.')
+        manual_row = next(
+            row for row in earned_badges(self.alice)
+            if row['key'] == 'badge:manual-honor'
+        )
+        self.assertTrue(manual_row['earned'])
+        self.assertIn(self.manual_badge, prestige_badges(self.alice))
+
+        removed_response = self.client.post(url, follow=True)
+
+        self.assertFalse(
+            UserBadge.objects.filter(
+                user=self.alice, badge=self.manual_badge,
+            ).exists()
+        )
+        self.assertContains(removed_response, 'Removed Manual Honor from alice.')
+        manual_row = next(
+            row for row in earned_badges(self.alice)
+            if row['key'] == 'badge:manual-honor'
+        )
+        self.assertFalse(manual_row['earned'])
+        self.assertNotIn(self.manual_badge, prestige_badges(self.alice))
+
+    def test_manual_award_does_not_override_automatic_achievement_logic(self):
+        from .services.achievements import (
+            achievement_checks,
+            earned_badges,
+            prestige_badges,
+        )
+
+        automatic_badge = Badge.objects.create(
+            name='Automatic First Entry',
+            slug='automatic-first-entry',
+            description='Requires a submission.',
+            achievement_key='first_pick',
+        )
+        self.client.force_login(self.staff)
+
+        self.client.post(reverse(
+            'badge_award', args=[automatic_badge.pk, self.alice.pk],
+        ))
+
+        self.assertTrue(
+            UserBadge.objects.filter(
+                user=self.alice, badge=automatic_badge,
+            ).exists()
+        )
+        self.assertFalse(achievement_checks(self.alice)['first_pick'])
+        automatic_row = next(
+            row for row in earned_badges(self.alice)
+            if row['key'] == 'first_pick'
+        )
+        self.assertFalse(automatic_row['earned'])
+        self.assertNotIn(automatic_badge, prestige_badges(self.alice))
+
+    def test_non_staff_cannot_mutate_membership_or_badges(self):
+        target = User.objects.create_user('protected-player', password='x')
+        self.client.force_login(self.alice)
+
+        membership_response = self.client.post(reverse(
+            'user_action', args=[target.pk, 'toggle_active'],
+        ))
+        badge_response = self.client.post(reverse(
+            'badge_award', args=[self.manual_badge.pk, target.pk],
+        ))
+
+        target.refresh_from_db()
+        self.assertEqual(membership_response.status_code, 302)
+        self.assertIn(reverse('login'), membership_response.url)
+        self.assertEqual(badge_response.status_code, 302)
+        self.assertIn(reverse('login'), badge_response.url)
+        self.assertTrue(target.is_active)
+        self.assertFalse(
+            UserBadge.objects.filter(
+                user=target, badge=self.manual_badge,
+            ).exists()
+        )
 
 
 @override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
@@ -534,16 +2468,68 @@ class V70RoundPrivacyTests(QueueUpTestMixin, TestCase):
         response = self.client.get(reverse('user_stats', args=[self.alice.username]))
         self.assertNotContains(response, 'secret')
 
+        profile = profile_for_user(self.alice)
+        self.assertEqual(list(profile.submissions), [])
+        self.assertEqual(profile.round_count, 0)
+        self.assertEqual(list(profile.seasons), [])
+
+    def test_voting_round_keeps_submitters_anonymous(self):
+        self.bob.first_name = 'Secret Submitter'
+        self.bob.save(update_fields=['first_name'])
+        self.submission(self.alice, 'own-secret')
+        self.submission(self.bob, 'anonymous-song')
+        self.client.force_login(self.alice)
+
+        response = self.client.get(reverse('round_detail', args=[self.round.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Mystery song')
+        self.assertNotContains(response, 'Secret Submitter')
+        self.assertNotContains(response, 'Picked by')
+
+    def test_revealed_round_still_shows_results_and_submitters(self):
+        self.bob.first_name = 'Revealed Submitter'
+        self.bob.save(update_fields=['first_name'])
+        alice_song = self.submission(self.alice, 'alice-result')
+        bob_song = self.submission(self.bob, 'revealed-song')
+        Vote.objects.create(
+            round=self.round, voter=self.cara, submission=alice_song, score=4,
+        )
+        Vote.objects.create(
+            round=self.round, voter=self.cara, submission=bob_song, score=5,
+        )
+        now = timezone.now()
+        self.round.voting_deadline = now - timedelta(hours=2)
+        self.round.reveal_at = now - timedelta(hours=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+        self.client.force_login(self.alice)
+
+        response = self.client.get(reverse('round_detail', args=[self.round.pk]))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'revealed-song')
+        self.assertContains(response, 'Revealed Submitter')
+        self.assertContains(response, 'Picked by')
+        self.assertContains(response, '5.00 ★')
+
     def test_voting_guide_acknowledgement_is_persistent(self):
         self.client.force_login(self.alice)
         self.assertFalse(self.alice.profile.voting_guide_seen)
+        self.assertContains(
+            self.client.get(reverse('round_detail', args=[self.round.pk])),
+            'data-voting-guide',
+        )
         self.client.post(reverse('voting_guide_seen'))
         self.alice.profile.refresh_from_db()
         self.assertTrue(self.alice.profile.voting_guide_seen)
+        self.assertNotContains(
+            self.client.get(reverse('round_detail', args=[self.round.pk])),
+            'data-voting-guide',
+        )
 
 
 class V70CleanMusicTests(QueueUpTestMixin, TestCase):
-    @patch('league.views.api_get')
+    @patch('league.services.submissions.api_get')
     def test_explicit_track_is_rejected_server_side(self, mocked_get):
         self.round.submission_opens = timezone.now() - timedelta(hours=1)
         self.round.submission_deadline = timezone.now() + timedelta(hours=1)
@@ -629,6 +2615,13 @@ class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
         self.assertNotIn('name="csrfmiddlewaretoken"', upload_form)
         self.assertIn(settings.CSRF_COOKIE_NAME, response.cookies)
         self.assertIn('no-cache', response.headers.get('Cache-Control', ''))
+
+    def test_csrf_exemption_is_isolated_to_picture_upload_endpoint(self):
+        from .views import profile_edit, remove_profile_picture, upload_profile_picture
+
+        self.assertTrue(upload_profile_picture.csrf_exempt)
+        self.assertFalse(getattr(profile_edit, 'csrf_exempt', False))
+        self.assertFalse(getattr(remove_profile_picture, 'csrf_exempt', False))
 
     def test_profile_edit_remains_csrf_protected(self):
         from django.test import Client
@@ -769,12 +2762,80 @@ class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
         self.alice.profile.refresh_from_db()
         self.assertFalse(bool(self.alice.profile.picture))
 
+    def test_replacing_picture_deletes_old_stored_file(self):
+        self.client.force_login(self.alice)
+        first = SimpleUploadedFile(
+            'first-profile-picture.png',
+            self.png_bytes(),
+            content_type='image/png',
+        )
+        self.client.post(
+            reverse('profile_picture_upload'),
+            {'picture': first},
+        )
+        self.alice.profile.refresh_from_db()
+        old_name = self.alice.profile.picture.name
+        storage = self.alice.profile.picture.storage
+        self.assertTrue(storage.exists(old_name))
+
+        second = SimpleUploadedFile(
+            'replacement-profile-picture.jpg',
+            self.jpeg_bytes(),
+            content_type='image/jpeg',
+        )
+        response = self.client.post(
+            reverse('profile_picture_upload'),
+            {'picture': second},
+        )
+
+        self.assertRedirects(response, reverse('profile_edit'))
+        self.alice.profile.refresh_from_db()
+        new_name = self.alice.profile.picture.name
+        self.assertNotEqual(new_name, old_name)
+        self.assertFalse(storage.exists(old_name))
+        self.assertTrue(storage.exists(new_name))
+        self.alice.profile.picture.delete(save=False)
+
+    def test_invalid_picture_does_not_replace_current_stored_file(self):
+        self.client.force_login(self.alice)
+        current = SimpleUploadedFile(
+            'current-profile-picture.png',
+            self.png_bytes(),
+            content_type='image/png',
+        )
+        self.client.post(
+            reverse('profile_picture_upload'),
+            {'picture': current},
+        )
+        self.alice.profile.refresh_from_db()
+        current_name = self.alice.profile.picture.name
+        storage = self.alice.profile.picture.storage
+
+        invalid = SimpleUploadedFile(
+            'invalid-replacement.txt',
+            b'not an image',
+            content_type='text/plain',
+        )
+        response = self.client.post(
+            reverse('profile_picture_upload'),
+            {'picture': invalid},
+        )
+
+        self.assertRedirects(response, reverse('profile_edit'))
+        self.alice.profile.refresh_from_db()
+        self.assertEqual(self.alice.profile.picture.name, current_name)
+        self.assertTrue(storage.exists(current_name))
+        self.alice.profile.picture.delete(save=False)
+
 
     def test_remove_picture_is_in_picture_card_and_remains_csrf_protected(self):
         from django.test import Client
         picture = SimpleUploadedFile('avatar.png', self.png_bytes(), content_type='image/png')
         self.alice.profile.picture = picture
         self.alice.profile.save(update_fields=['picture', 'updated_at'])
+        stored_name = self.alice.profile.picture.name
+        storage = self.alice.profile.picture.storage
+        self.assertTrue(storage.exists(stored_name))
 
         client = Client(enforce_csrf_checks=True)
         self.assertTrue(client.login(username='alice', password='x'))
@@ -797,6 +2858,7 @@ class ProfileUploadCsrfTests(QueueUpTestMixin, TestCase):
         self.assertRedirects(removed, reverse('profile_edit'))
         self.alice.profile.refresh_from_db()
         self.assertFalse(bool(self.alice.profile.picture))
+        self.assertFalse(storage.exists(stored_name))
 
 class RoundStatusTests(QueueUpTestMixin, TestCase):
     def setUp(self):
@@ -807,6 +2869,14 @@ class RoundStatusTests(QueueUpTestMixin, TestCase):
         url = reverse('round_status', args=[self.round.pk])
         self.client.force_login(self.alice)
         response = self.client.get(url)
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse('login'), response.url)
+
+    def test_control_rounds_requires_staff(self):
+        self.client.force_login(self.alice)
+
+        response = self.client.get(reverse('control_rounds'))
+
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse('login'), response.url)
 
@@ -830,7 +2900,16 @@ class RoundStatusTests(QueueUpTestMixin, TestCase):
         self.assertContains(response, 'Not started')
         self.assertContains(response, 'No submission')
 
+        self.assertEqual(
+            [row['player'].username for row in response.context['rows']],
+            ['alice', 'bob', 'cara', 'staff'],
+        )
         rows = {row['player'].username: row for row in response.context['rows']}
+        self.assertEqual(set(rows), {'alice', 'bob', 'cara', 'staff'})
+        self.assertIsNotNone(rows['alice']['submission'])
+        self.assertIsNotNone(rows['bob']['submission'])
+        self.assertIsNotNone(rows['cara']['submission'])
+        self.assertIsNone(rows['staff']['submission'])
         self.assertTrue(rows['alice']['voting_complete'])
         self.assertEqual(rows['alice']['voted_count'], 2)
         self.assertEqual(rows['alice']['eligible_count'], 2)
@@ -838,6 +2917,12 @@ class RoundStatusTests(QueueUpTestMixin, TestCase):
         self.assertEqual(rows['bob']['voted_count'], 1)
         self.assertEqual(rows['bob']['eligible_count'], 2)
         self.assertFalse(rows['cara']['voting_started'])
+        self.assertFalse(rows['cara']['voting_complete'])
+        self.assertFalse(rows['staff']['voting_started'])
+        self.assertFalse(rows['staff']['voting_complete'])
+        self.assertEqual(rows['staff']['voted_count'], 0)
+        self.assertEqual(rows['staff']['eligible_count'], 3)
+        self.assertEqual(response.context['player_count'], 4)
         self.assertEqual(response.context['submitted_count'], 3)
         self.assertEqual(response.context['completed_count'], 1)
 
@@ -860,7 +2945,7 @@ class GenreHopperAchievementTests(QueueUpTestMixin, TestCase):
         )
 
     def test_one_song_with_many_subgenres_counts_as_only_one_main_genre(self):
-        from .achievements import achievement_checks
+        from .services.achievements import achievement_checks
         from .models import Submission
 
         rnd = self._revealed_round(1)
@@ -874,7 +2959,7 @@ class GenreHopperAchievementTests(QueueUpTestMixin, TestCase):
         self.assertFalse(achievement_checks(self.alice)['genre_hopper'])
 
     def test_unrevealed_round_does_not_count_toward_genre_hopper(self):
-        from .achievements import achievement_checks
+        from .services.achievements import achievement_checks
         from .models import Submission
 
         broad_genres = [
@@ -900,7 +2985,7 @@ class GenreHopperAchievementTests(QueueUpTestMixin, TestCase):
         self.assertFalse(achievement_checks(self.alice)['genre_hopper'])
 
     def test_ten_completed_songs_in_ten_main_genres_unlocks(self):
-        from .achievements import achievement_checks
+        from .services.achievements import achievement_checks
         from .models import Submission
 
         genre_tags = [
@@ -925,6 +3010,396 @@ class GenreHopperAchievementTests(QueueUpTestMixin, TestCase):
             )
 
         self.assertTrue(achievement_checks(self.alice)['genre_hopper'])
+
+class SubmissionWorkflowTests(QueueUpTestMixin, TestCase):
+    first_track_id = 'AAAAAAAAAAAAAAAAAAAAAA'
+    second_track_id = 'BBBBBBBBBBBBBBBBBBBBBB'
+
+    def setUp(self):
+        super().setUp()
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(hours=1)
+        self.round.submission_deadline = now + timedelta(hours=1)
+        self.round.save(update_fields=['submission_opens', 'submission_deadline'])
+        self.client.force_login(self.alice)
+
+    def accept_rules(self):
+        self.alice.profile.submission_rules_accepted_at = timezone.now()
+        self.alice.profile.save(update_fields=['submission_rules_accepted_at'])
+
+    @staticmethod
+    def spotify_track(track_id, *, isrc='USABC1234567', explicit=False):
+        return {
+            'id': track_id,
+            'uri': f'spotify:track:{track_id}',
+            'external_urls': {
+                'spotify': f'https://open.spotify.com/track/{track_id}',
+            },
+            'external_ids': {'isrc': isrc},
+            'name': 'Verified Song',
+            'explicit': explicit,
+            'artists': [
+                {'id': 'artist-one', 'name': 'Artist One'},
+                {'id': 'artist-two', 'name': 'Artist Two'},
+            ],
+            'album': {
+                'name': 'Verified Album',
+                'images': [{'url': 'https://images.example/cover.jpg'}],
+            },
+            'preview_url': 'https://audio.example/preview.mp3',
+        }
+
+    def assert_user_has_no_score(self):
+        self.assertFalse(any(
+            entry.item.pk == self.alice.pk
+            for entry in season_leaderboard(self.season)
+        ))
+
+    @patch('league.views.broadcast')
+    @patch(
+        'league.services.submissions.genres_for_artists',
+        return_value=['alternative rock'],
+    )
+    @patch('league.services.submissions.api_get')
+    def test_success_preserves_metadata_bonus_and_realtime_event(
+        self, mocked_get, mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.return_value = self.spotify_track(self.first_track_id)
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {
+                'track_id': (
+                    f'https://open.spotify.com/track/{self.first_track_id}?si=test'
+                ),
+            },
+            follow=True,
+        )
+
+        submission = Submission.objects.get(round=self.round, user=self.alice)
+        self.assertEqual(submission.spotify_track_id, self.first_track_id)
+        self.assertEqual(submission.isrc, 'USABC1234567')
+        self.assertEqual(submission.spotify_uri, f'spotify:track:{self.first_track_id}')
+        self.assertEqual(
+            submission.spotify_url,
+            f'https://open.spotify.com/track/{self.first_track_id}',
+        )
+        self.assertEqual(submission.title, 'Verified Song')
+        self.assertEqual(submission.artist, 'Artist One, Artist Two')
+        self.assertEqual(submission.artist_ids, ['artist-one', 'artist-two'])
+        self.assertEqual(submission.genres, ['alternative rock'])
+        self.assertEqual(submission.album, 'Verified Album')
+        self.assertEqual(
+            submission.album_art_url,
+            'https://images.example/cover.jpg',
+        )
+        self.assertEqual(
+            submission.preview_url,
+            'https://audio.example/preview.mp3',
+        )
+        self.assertFalse(submission.explicit)
+        mocked_get.assert_called_once_with(f'/tracks/{self.first_track_id}')
+        mocked_genres.assert_called_once_with(['artist-one', 'artist-two'])
+        mocked_broadcast.assert_called_once_with(
+            'submission_added',
+            round_id=self.round.id,
+            submissions=1,
+        )
+        player = next(
+            entry.item
+            for entry in season_leaderboard(self.season)
+            if entry.item.pk == self.alice.pk
+        )
+        self.assertEqual(player.submission_bonus, SUBMISSION_BONUS_POINTS)
+        self.assertEqual(player.total_score, SUBMISSION_BONUS_POINTS)
+        self.assertContains(
+            response,
+            f'You earned {SUBMISSION_BONUS_POINTS} points for submitting!',
+        )
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_deleting_and_replacing_submission_restores_bonus(
+        self, mocked_get, _mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.side_effect = [
+            self.spotify_track(self.first_track_id, isrc='USFIRST12345'),
+            self.spotify_track(self.second_track_id, isrc='USSECOND1234'),
+        ]
+        submit_url = reverse('submit_song', args=[self.round.pk])
+
+        self.client.post(submit_url, {'track_id': self.first_track_id})
+        first = Submission.objects.get(round=self.round, user=self.alice)
+        self.assertEqual(
+            next(
+                entry.item
+                for entry in season_leaderboard(self.season)
+                if entry.item.pk == self.alice.pk
+            ).submission_bonus,
+            SUBMISSION_BONUS_POINTS,
+        )
+
+        first.delete()
+        self.assert_user_has_no_score()
+
+        self.client.post(submit_url, {'track_id': self.second_track_id})
+        replacement = Submission.objects.get(round=self.round, user=self.alice)
+        self.assertEqual(replacement.spotify_track_id, self.second_track_id)
+        self.assertEqual(
+            next(
+                entry.item
+                for entry in season_leaderboard(self.season)
+                if entry.item.pk == self.alice.pk
+            ).submission_bonus,
+            SUBMISSION_BONUS_POINTS,
+        )
+        self.assertEqual(mocked_broadcast.call_count, 2)
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.api_get')
+    def test_submission_outside_allowed_phase_is_rejected(
+        self, mocked_get, mocked_broadcast,
+    ):
+        self.round.submission_deadline = timezone.now() - timedelta(minutes=1)
+        self.round.save(update_fields=['submission_deadline'])
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(response, 'Submissions are closed.')
+        self.assertFalse(Submission.objects.filter(round=self.round).exists())
+        self.assert_user_has_no_score()
+        mocked_get.assert_not_called()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists')
+    @patch('league.services.submissions.api_get')
+    def test_submission_rules_acceptance_remains_required(
+        self, mocked_get, mocked_genres, mocked_broadcast,
+    ):
+        mocked_get.return_value = self.spotify_track(self.first_track_id)
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(
+            response,
+            'Please confirm the clean, all-ages music rule before submitting.',
+        )
+        self.assertFalse(Submission.objects.filter(round=self.round).exists())
+        self.assert_user_has_no_score()
+        mocked_genres.assert_not_called()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.api_get')
+    def test_spotify_refetch_failure_creates_nothing_and_awards_no_points(
+        self, mocked_get, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.side_effect = RuntimeError('Spotify unavailable')
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(response, 'That Spotify track could not be verified.')
+        self.assertFalse(Submission.objects.filter(round=self.round).exists())
+        self.assert_user_has_no_score()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists')
+    @patch('league.services.submissions.api_get')
+    def test_explicit_track_creates_nothing_and_awards_no_points(
+        self, mocked_get, mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.return_value = self.spotify_track(
+            self.first_track_id,
+            explicit=True,
+        )
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(response, 'No explicit songs allowed.')
+        self.assertFalse(Submission.objects.filter(round=self.round).exists())
+        self.assert_user_has_no_score()
+        mocked_genres.assert_not_called()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_same_isrc_duplicate_creates_nothing_and_awards_no_points(
+        self, mocked_get, _mocked_genres, mocked_broadcast,
+    ):
+        existing = self.submission(self.bob, 'existing-track')
+        existing.isrc = 'USABC1234567'
+        existing.save(update_fields=['isrc'])
+        self.accept_rules()
+        mocked_get.return_value = self.spotify_track(self.first_track_id)
+
+        response = self.client.post(
+            reverse('submit_song', args=[self.round.pk]),
+            {'track_id': self.first_track_id},
+            follow=True,
+        )
+
+        self.assertContains(
+            response,
+            'That recording has already been submitted for this round.',
+        )
+        self.assertFalse(
+            Submission.objects.filter(round=self.round, user=self.alice).exists()
+        )
+        self.assert_user_has_no_score()
+        mocked_broadcast.assert_not_called()
+
+    @patch('league.views.broadcast')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_second_submission_by_same_user_preserves_existing_submission(
+        self, mocked_get, _mocked_genres, mocked_broadcast,
+    ):
+        self.accept_rules()
+        mocked_get.side_effect = [
+            self.spotify_track(self.first_track_id, isrc='USFIRST12345'),
+            self.spotify_track(self.second_track_id, isrc='USSECOND1234'),
+        ]
+        submit_url = reverse('submit_song', args=[self.round.pk])
+        self.client.post(submit_url, {'track_id': self.first_track_id})
+
+        response = self.client.post(
+            submit_url,
+            {'track_id': self.second_track_id},
+            follow=True,
+        )
+
+        submissions = Submission.objects.filter(round=self.round, user=self.alice)
+        self.assertEqual(submissions.count(), 1)
+        self.assertEqual(submissions.get().spotify_track_id, self.first_track_id)
+        self.assertContains(
+            response,
+            'You already submitted, or somebody chose that song first.',
+        )
+        player = next(
+            entry.item
+            for entry in season_leaderboard(self.season)
+            if entry.item.pk == self.alice.pk
+        )
+        self.assertEqual(player.submission_bonus, SUBMISSION_BONUS_POINTS)
+        mocked_broadcast.assert_called_once()
+
+
+class SubmissionIsrcIntegrityTests(QueueUpTestMixin, TransactionTestCase):
+    def create_submission(self, round_obj, user, track_id, isrc):
+        return Submission.objects.create(
+            round=round_obj,
+            user=user,
+            spotify_track_id=track_id,
+            isrc=isrc,
+            spotify_uri=f'spotify:track:{track_id}',
+            spotify_url=f'https://open.spotify.com/track/{track_id}',
+            title=track_id,
+            artist='Artist',
+        )
+
+    def another_round(self):
+        now = timezone.now()
+        return Round.objects.create(
+            season=self.season,
+            prompt='Another round',
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+
+    def test_same_isrc_in_same_round_is_rejected_by_database(self):
+        self.create_submission(self.round, self.alice, 'track-a', 'SAMEISRC')
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.create_submission(
+                self.round, self.bob, 'different-track', 'SAMEISRC',
+            )
+
+    def test_same_isrc_in_different_round_is_allowed(self):
+        self.create_submission(self.round, self.alice, 'track-a', 'SAMEISRC')
+
+        second = self.create_submission(
+            self.another_round(), self.bob, 'track-b', 'SAMEISRC',
+        )
+
+        self.assertIsNotNone(second.pk)
+
+    def test_different_isrcs_in_same_round_are_allowed(self):
+        self.create_submission(self.round, self.alice, 'track-a', 'ISRC-A')
+
+        second = self.create_submission(
+            self.round, self.bob, 'track-b', 'ISRC-B',
+        )
+
+        self.assertIsNotNone(second.pk)
+
+    def test_multiple_null_isrc_rows_and_same_track_id_are_allowed(self):
+        self.create_submission(self.round, self.alice, 'shared-track', None)
+
+        second = self.create_submission(
+            self.round, self.bob, 'shared-track', None,
+        )
+
+        self.assertIsNotNone(second.pk)
+
+    @patch(
+        'league.services.submissions.Submission.objects.create',
+        side_effect=IntegrityError('duplicate'),
+    )
+    @patch('league.services.submissions.Submission.objects.filter')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
+    def test_service_maps_raced_isrc_conflict_to_duplicate_recording(
+        self, mocked_get, _mocked_genres, mocked_filter, _mocked_create,
+    ):
+        from .services import submissions as submission_service
+
+        now = timezone.now()
+        self.round.submission_opens = now - timedelta(hours=1)
+        self.round.submission_deadline = now + timedelta(hours=1)
+        self.round.save(update_fields=[
+            'submission_opens', 'submission_deadline',
+        ])
+        self.alice.profile.submission_rules_accepted_at = now
+        self.alice.profile.save(update_fields=['submission_rules_accepted_at'])
+        mocked_get.return_value = SubmissionWorkflowTests.spotify_track(
+            SubmissionWorkflowTests.first_track_id,
+            isrc='RACEISRC',
+        )
+        mocked_filter.return_value.exists.side_effect = [False, True]
+
+        with self.assertRaises(submission_service.DuplicateRecording):
+            submission_service.create_submission(
+                self.round,
+                self.alice,
+                SubmissionWorkflowTests.first_track_id,
+            )
+
 
 class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):
     def setUp(self):
@@ -952,7 +3427,7 @@ class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):
             'preview_url': None,
         }
 
-    @patch('league.views.api_get')
+    @patch('league.services.spotify_search.api_get')
     def test_search_grays_out_different_track_id_with_same_isrc(self, mocked_get):
         Submission.objects.create(
             round=self.round, user=self.alice,
@@ -972,8 +3447,8 @@ class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):
         self.assertEqual(track['isrc'], 'USABC1234567')
         self.assertTrue(track['used'])
 
-    @patch('league.views.genres_for_artists', return_value=[])
-    @patch('league.views.api_get')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
     def test_server_rejects_same_isrc_with_different_track_id(self, mocked_get, mocked_genres):
         Submission.objects.create(
             round=self.round, user=self.alice,
@@ -993,14 +3468,269 @@ class IsrcDuplicateSubmissionTests(QueueUpTestMixin, TestCase):
         self.assertContains(response, 'That recording has already been submitted for this round.')
         self.assertFalse(Submission.objects.filter(round=self.round, user=self.bob).exists())
 
-    @patch('league.views.genres_for_artists', return_value=[])
-    @patch('league.views.api_get')
+    @patch('league.services.submissions.genres_for_artists', return_value=[])
+    @patch('league.services.submissions.api_get')
     def test_new_submission_saves_normalized_isrc(self, mocked_get, mocked_genres):
         mocked_get.return_value = self.spotify_track('CCCCCCCCCCCCCCCCCCCCCC', 'New Recording', 'usxyz7654321')
         self.client.force_login(self.alice)
         self.client.post(reverse('submit_song', args=[self.round.pk]), {'track_id': 'CCCCCCCCCCCCCCCCCCCCCC'})
         submission = Submission.objects.get(round=self.round, user=self.alice)
         self.assertEqual(submission.isrc, 'USXYZ7654321')
+
+class RoundLifecycleCommandTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user(
+            'lifecycle-staff', password='x', is_staff=True,
+        )
+        self.client.force_login(self.staff)
+
+    def create_round_history(self):
+        alice_song = self.submission(self.alice, 'lifecycle-alice')
+        bob_song = self.submission(self.bob, 'lifecycle-bob')
+        vote = Vote.objects.create(
+            round=self.round,
+            voter=self.cara,
+            submission=alice_song,
+            score=4,
+        )
+        return alice_song.pk, bob_song.pk, vote.pk
+
+    def assert_round_history_preserved(self, history_ids):
+        alice_id, bob_id, vote_id = history_ids
+        self.assertTrue(Submission.objects.filter(pk=alice_id).exists())
+        self.assertTrue(Submission.objects.filter(pk=bob_id).exists())
+        self.assertTrue(Vote.objects.filter(pk=vote_id, score=4).exists())
+
+    def run_action(self, action, fixed_now):
+        with (
+            patch(
+                'league.services.rounds.timezone.now',
+                return_value=fixed_now,
+            ),
+            patch('league.views.broadcast') as mocked_broadcast,
+        ):
+            response = self.client.post(
+                reverse('round_action', args=[self.round.pk, action]),
+            )
+        self.assertRedirects(
+            response,
+            reverse('control_rounds'),
+            fetch_redirect_response=False,
+        )
+        self.round.refresh_from_db()
+        return mocked_broadcast
+
+    def test_open_submissions_sets_current_time_and_expired_default_duration(self):
+        fixed_now = timezone.now()
+        original_voting_deadline = fixed_now + timedelta(days=5)
+        original_reveal_at = fixed_now + timedelta(days=6)
+        self.round.submission_opens = fixed_now + timedelta(days=1)
+        self.round.submission_deadline = fixed_now - timedelta(minutes=1)
+        self.round.voting_deadline = original_voting_deadline
+        self.round.reveal_at = original_reveal_at
+        self.round.save()
+        history_ids = self.create_round_history()
+
+        mocked_broadcast = self.run_action('open_submissions', fixed_now)
+
+        self.assertEqual(self.round.submission_opens, fixed_now)
+        self.assertEqual(
+            self.round.submission_deadline,
+            fixed_now + timedelta(days=3),
+        )
+        self.assertEqual(self.round.voting_deadline, original_voting_deadline)
+        self.assertEqual(self.round.reveal_at, original_reveal_at)
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='submitting',
+        )
+
+    def test_open_voting_sets_current_time_and_expired_default_duration(self):
+        fixed_now = timezone.now()
+        original_opens = fixed_now - timedelta(days=3)
+        original_reveal_at = fixed_now + timedelta(days=6)
+        self.round.submission_opens = original_opens
+        self.round.submission_deadline = fixed_now + timedelta(days=1)
+        self.round.voting_deadline = fixed_now - timedelta(minutes=1)
+        self.round.reveal_at = original_reveal_at
+        self.round.save()
+        history_ids = self.create_round_history()
+
+        mocked_broadcast = self.run_action('open_voting', fixed_now)
+
+        self.assertEqual(self.round.submission_opens, original_opens)
+        self.assertEqual(self.round.submission_deadline, fixed_now)
+        self.assertEqual(
+            self.round.voting_deadline,
+            fixed_now + timedelta(days=2),
+        )
+        self.assertEqual(self.round.reveal_at, original_reveal_at)
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='voting',
+        )
+
+    def test_lock_voting_sets_current_time_and_expired_reveal_default(self):
+        fixed_now = timezone.now()
+        original_opens = fixed_now - timedelta(days=3)
+        original_submission_deadline = fixed_now - timedelta(days=1)
+        self.round.submission_opens = original_opens
+        self.round.submission_deadline = original_submission_deadline
+        self.round.voting_deadline = fixed_now + timedelta(days=1)
+        self.round.reveal_at = fixed_now - timedelta(minutes=1)
+        self.round.save()
+        history_ids = self.create_round_history()
+
+        mocked_broadcast = self.run_action('lock_voting', fixed_now)
+
+        self.assertEqual(self.round.submission_opens, original_opens)
+        self.assertEqual(
+            self.round.submission_deadline,
+            original_submission_deadline,
+        )
+        self.assertEqual(self.round.voting_deadline, fixed_now)
+        self.assertEqual(
+            self.round.reveal_at,
+            fixed_now + timedelta(minutes=5),
+        )
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='locked',
+        )
+
+    def test_reveal_sets_only_reveal_time_and_preserves_history(self):
+        fixed_now = timezone.now()
+        original_opens = fixed_now - timedelta(days=4)
+        original_submission_deadline = fixed_now - timedelta(days=3)
+        original_voting_deadline = fixed_now - timedelta(days=2)
+        self.round.submission_opens = original_opens
+        self.round.submission_deadline = original_submission_deadline
+        self.round.voting_deadline = original_voting_deadline
+        self.round.reveal_at = fixed_now + timedelta(days=1)
+        self.round.save()
+        history_ids = self.create_round_history()
+
+        mocked_broadcast = self.run_action('reveal', fixed_now)
+
+        self.assertEqual(self.round.submission_opens, original_opens)
+        self.assertEqual(
+            self.round.submission_deadline,
+            original_submission_deadline,
+        )
+        self.assertEqual(self.round.voting_deadline, original_voting_deadline)
+        self.assertEqual(self.round.reveal_at, fixed_now)
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='revealed',
+        )
+
+    def test_reveal_ends_future_voting_deadline_and_is_immediately_revealed(self):
+        fixed_now = timezone.now()
+        future_voting_deadline = fixed_now + timedelta(days=1)
+        self.round.submission_opens = fixed_now - timedelta(days=2)
+        self.round.submission_deadline = fixed_now - timedelta(days=1)
+        self.round.voting_deadline = future_voting_deadline
+        self.round.reveal_at = fixed_now + timedelta(days=2)
+        self.round.save()
+
+        mocked_broadcast = self.run_action('reveal', fixed_now)
+
+        self.assertEqual(self.round.voting_deadline, fixed_now)
+        self.assertEqual(self.round.reveal_at, fixed_now)
+        self.assertEqual(self.round.state, 'revealed')
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='revealed',
+        )
+
+    def test_invalid_transition_is_rejected_without_changes_or_broadcast(self):
+        fixed_now = timezone.now()
+        self.round.submission_opens = fixed_now + timedelta(days=1)
+        self.round.submission_deadline = fixed_now + timedelta(days=2)
+        self.round.voting_deadline = fixed_now + timedelta(days=3)
+        self.round.reveal_at = fixed_now + timedelta(days=4)
+        self.round.save()
+        original_schedule = (
+            self.round.submission_opens,
+            self.round.submission_deadline,
+            self.round.voting_deadline,
+            self.round.reveal_at,
+        )
+
+        with (
+            patch(
+                'league.services.rounds.timezone.now',
+                return_value=fixed_now,
+            ),
+            patch('league.views.broadcast') as mocked_broadcast,
+        ):
+            response = self.client.post(
+                reverse('round_action', args=[self.round.pk, 'open_voting']),
+                follow=True,
+            )
+
+        self.round.refresh_from_db()
+        self.assertContains(
+            response, 'That round cannot make this transition yet.',
+        )
+        self.assertEqual(
+            (
+                self.round.submission_opens,
+                self.round.submission_deadline,
+                self.round.voting_deadline,
+                self.round.reveal_at,
+            ),
+            original_schedule,
+        )
+        mocked_broadcast.assert_not_called()
+
+    def test_archive_preserves_schedule_submissions_votes_and_broadcast(self):
+        fixed_now = timezone.now()
+        self.round.submission_opens = fixed_now - timedelta(days=4)
+        self.round.submission_deadline = fixed_now - timedelta(days=3)
+        self.round.voting_deadline = fixed_now - timedelta(days=2)
+        self.round.reveal_at = fixed_now - timedelta(days=1)
+        self.round.save()
+        original_schedule = (
+            self.round.submission_opens,
+            self.round.submission_deadline,
+            self.round.voting_deadline,
+            self.round.reveal_at,
+        )
+        history_ids = self.create_round_history()
+
+        with (
+            patch(
+                'league.services.rounds.timezone.now',
+                return_value=fixed_now,
+            ),
+            patch('league.views.broadcast') as mocked_broadcast,
+        ):
+            response = self.client.post(
+                reverse('round_archive', args=[self.round.pk]),
+            )
+
+        self.assertRedirects(
+            response,
+            reverse('control_rounds'),
+            fetch_redirect_response=False,
+        )
+        self.round.refresh_from_db()
+        self.assertTrue(self.round.archived)
+        self.assertEqual(
+            (
+                self.round.submission_opens,
+                self.round.submission_deadline,
+                self.round.voting_deadline,
+                self.round.reveal_at,
+            ),
+            original_schedule,
+        )
+        self.assert_round_history_preserved(history_ids)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='revealed',
+        )
+
 
 class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
     def setUp(self):
@@ -1065,7 +3795,10 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
         self.assertAlmostEqual(self.round.goes_live_at.timestamp(), scheduled_live.replace(second=0, microsecond=0).timestamp(), delta=1)
         self.assertFalse(self.round.is_visible)
 
-    def test_save_and_publish_activates_draft_and_overrides_go_live_time(self):
+    @patch('league.views.broadcast')
+    def test_save_and_publish_activates_draft_and_overrides_go_live_time(
+        self, mocked_broadcast,
+    ):
         self.round.is_draft = True
         self.round.save(update_fields=['is_draft'])
         before = timezone.now()
@@ -1081,6 +3814,9 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
         self.assertGreaterEqual(self.round.goes_live_at, before - timedelta(seconds=1))
         self.assertLessEqual(self.round.goes_live_at, timezone.now() + timedelta(seconds=1))
         self.assertTrue(self.round.is_visible)
+        mocked_broadcast.assert_called_once_with(
+            'round_updated', round_id=self.round.id, state='upcoming',
+        )
 
     def _reveal_round(self):
         now = timezone.now()
@@ -1103,16 +3839,33 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
             spotify_uri='spotify:track:count-b', spotify_url='https://open.spotify.com/track/count-b',
             title='Second', artist='Artist',
         )
+        third = Submission.objects.create(
+            round=self.round, user=self.cara, spotify_track_id='count-c',
+            spotify_uri='spotify:track:count-c',
+            spotify_url='https://open.spotify.com/track/count-c',
+            title='Third', artist='Artist',
+        )
         Vote.objects.create(round=self.round, voter=self.bob, submission=first, score=4)
         Vote.objects.create(round=self.round, voter=self.alice, submission=second, score=5)
         Vote.objects.create(round=self.round, voter=self.cara, submission=first, score=3)
+        Vote.objects.create(round=self.round, voter=self.alice, submission=third, score=4)
+        Vote.objects.create(round=self.round, voter=self.bob, submission=third, score=5)
+        Vote.objects.create(round=self.round, voter=self.cara, submission=second, score=4)
 
         response = self.client.get(reverse('control_rounds'))
         row = next(r for r in response.context['rounds'] if r.pk == self.round.pk)
-        self.assertEqual(row.submission_count, 2)
-        self.assertEqual(row.vote_count, 3)
+        self.assertEqual(Submission.objects.filter(round=self.round).count(), 3)
+        self.assertEqual(Vote.objects.filter(round=self.round).count(), 6)
+        self.assertEqual(row.submission_count, 3)
+        self.assertEqual(row.submitted_player_count, 3)
+        self.assertEqual(row.vote_count, 6)
 
     def test_round_cards_show_submission_and_completed_voter_progress(self):
+        inactive = User.objects.create_user(
+            'inactive-approved', password='x', is_active=False,
+        )
+        inactive.profile.approved = True
+        inactive.profile.save(update_fields=['approved'])
         alice_song = Submission.objects.create(
             round=self.round, user=self.alice, spotify_track_id='progress-a',
             spotify_uri='spotify:track:progress-a', spotify_url='https://open.spotify.com/track/progress-a',

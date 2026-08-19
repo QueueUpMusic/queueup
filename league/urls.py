@@ -2,13 +2,14 @@ from django.contrib.auth.views import (
     LoginView, LogoutView, PasswordResetCompleteView, PasswordResetConfirmView,
     PasswordResetDoneView, PasswordResetView,
 )
-from django.urls import path
+from django.urls import include, path
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import ensure_csrf_cookie
 
 from . import views
 
 urlpatterns = [
+    path('api/v1/', include('league.api.urls')),
     path('health/', views.health, name='health'),
     path('service-worker.js', views.service_worker, name='service_worker'),
     path('', views.landing, name='landing'),

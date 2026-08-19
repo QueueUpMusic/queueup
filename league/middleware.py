@@ -16,6 +16,8 @@ class ApprovalRequiredMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
+        if request.path_info.startswith('/api/v1/'):
+            return self.get_response(request)
         if request.user.is_authenticated and not request.user.is_staff and not request.user.is_superuser:
             profile, _ = UserProfile.objects.get_or_create(user=request.user)
             if not profile.approved:

@@ -59,6 +59,7 @@ CSRF_COOKIE_SECURE = os.getenv('COOKIE_SECURE', '0') == '1'
 CSRF_COOKIE_NAME = os.getenv('CSRF_COOKIE_NAME', 'queueup_csrftoken_v2')
 CSRF_COOKIE_PATH = '/'
 CSRF_COOKIE_SAMESITE = 'Lax'
+CSRF_FAILURE_VIEW = 'league.api.responses.csrf_failure'
 SESSION_COOKIE_SAMESITE = 'Lax'
 WEBPUSH_PUBLIC_KEY = os.getenv('WEBPUSH_PUBLIC_KEY', '')
 WEBPUSH_PRIVATE_KEY = os.getenv('WEBPUSH_PRIVATE_KEY', '')
