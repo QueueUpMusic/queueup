@@ -1,7 +1,7 @@
 {% extends 'league/base.html' %}
 {% block title %}{{ recap.season.name }} Recap · QueueUp{% endblock %}
 {% block content %}
-<section class="recap" data-recap aria-label="{{ recap.season.name }} personal season recap">
+<section class="recap" data-recap data-recap-season="{{ recap.season.name }}" aria-label="{{ recap.season.name }} personal season recap">
   <a class="recap-exit" href="{% url 'home' %}">← Back to QueueUp</a>
   <div class="recap-progress" aria-label="Recap progress">{% for slide in recap.slides %}<span{% if forloop.first %} class="is-active"{% endif %}></span>{% endfor %}</div>
   <div class="recap-slides">
@@ -26,7 +26,7 @@
       {% elif slide.kind == 'league' %}
         <p class="recap-kicker">The league season</p><div class="recap-league-numbers"><div><b>{{ slide.song_count }}</b><span>songs submitted</span></div><div><b>{{ slide.rating_count }}</b><span>counted ratings</span></div><div><b>{{ slide.round_count }}</b><span>rounds played</span></div></div>{% if slide.top_song %}<p class="recap-overline">Season's top song</p><h2>{{ slide.top_song.title }}</h2><p class="recap-lede">{{ slide.top_song.artist }} · {{ slide.top_song.average }} ★ average</p>{% endif %}
       {% elif slide.kind == 'summary' %}
-        <p class="recap-kicker">QueueUp season recap</p>{% if slide.standing %}<h2 class="recap-summary-place">#{{ slide.standing.place }} overall</h2><p class="recap-lede">{{ slide.standing.item.total_score }} points</p>{% endif %}<div class="recap-summary-grid">{% if slide.song_of_season %}<div><small>Song of the season</small><strong>{{ slide.song_of_season.title }}</strong><span>{{ slide.song_of_season.artist }}</span></div>{% endif %}{% if slide.favorite_artist %}<div><small>Favorite artist</small><strong>{{ slide.favorite_artist }}</strong></div>{% endif %}{% if slide.best_submission %}<div><small>Best submission</small><strong>{{ slide.best_submission.title }}</strong><span>{{ slide.best_submission.artist }}</span></div>{% endif %}</div><p class="recap-thanks">{{ slide.podiums }} podium{{ slide.podiums|pluralize }} · {{ slide.wins }} win{{ slide.wins|pluralize }} · {{ slide.round_count }} rounds played<br>Thanks for playing.</p>
+        <p class="recap-kicker">QueueUp season recap</p>{% if slide.standing %}<h2 class="recap-summary-place">#{{ slide.standing.place }} overall</h2><p class="recap-lede">{{ slide.standing.item.total_score }} points</p>{% endif %}<div class="recap-summary-grid">{% if slide.song_of_season %}<div><small>Song of the season</small><strong>{{ slide.song_of_season.title }}</strong><span>{{ slide.song_of_season.artist }}</span></div>{% endif %}{% if slide.favorite_artist %}<div><small>Favorite artist</small><strong>{{ slide.favorite_artist }}</strong></div>{% endif %}{% if slide.best_submission %}<div><small>Best submission</small><strong>{{ slide.best_submission.title }}</strong><span>{{ slide.best_submission.artist }}</span></div>{% endif %}</div><p class="recap-thanks">{{ slide.podiums }} podium{{ slide.podiums|pluralize }} · {{ slide.wins }} win{{ slide.wins|pluralize }} · {{ slide.round_count }} rounds played<br>Thanks for playing.</p><button class="recap-share" type="button" data-recap-share>Share your recap</button>
       {% endif %}
       </div>
     </article>

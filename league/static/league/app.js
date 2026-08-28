@@ -27,6 +27,20 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 
 
+document.addEventListener('DOMContentLoaded',()=>{
+ const recap=document.querySelector('[data-recap]'),share=recap?.querySelector('[data-recap-share]');if(!share)return;
+ const esc=value=>String(value||'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[char]));
+ share.addEventListener('click',async()=>{
+  const summary=recap.querySelector('.recap-summary'),rows=[...summary.querySelectorAll('.recap-summary-grid div')].map(row=>[row.querySelector('small')?.textContent,row.querySelector('strong')?.textContent,row.querySelector('span')?.textContent].filter(Boolean));
+  const season=recap.dataset.recapSeason,standing=summary.querySelector('.recap-summary-place')?.textContent,points=summary.querySelector('.recap-lede')?.textContent,thanks=summary.querySelector('.recap-thanks')?.textContent.replace(/\s+/g,' ').trim();
+  const cards=rows.map(([label,value,detail],index)=>'<g transform="translate(72 '+(470+index*170)+')"><rect width="936" height="138" rx="28" fill="#ffffff" fill-opacity=".13"/><text x="34" y="43" fill="#ffdf70" font-size="22" font-weight="700" letter-spacing="3">'+esc(label).toUpperCase()+'</text><text x="34" y="84" fill="white" font-size="34" font-weight="800">'+esc(value)+'</text>'+(detail?'<text x="34" y="116" fill="#ded8f2" font-size="23">'+esc(detail)+'</text>':'')+'</g>').join('');
+  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#2a104d"/><stop offset=".52" stop-color="#7a287d"/><stop offset="1" stop-color="#f06b71"/></linearGradient></defs><rect width="1080" height="1350" fill="url(#g)"/><circle cx="970" cy="92" r="250" fill="#ffdf70" fill-opacity=".18"/><circle cx="-60" cy="1280" r="300" fill="#6255e6" fill-opacity=".45"/><text x="72" y="125" fill="#ffdf70" font-size="25" font-weight="800" letter-spacing="5">QUEUEUP SEASON RECAP</text><text x="72" y="215" fill="white" font-size="65" font-weight="900">'+esc(season)+'</text><text x="72" y="360" fill="white" font-size="132" font-weight="900">'+esc(standing)+'</text><text x="78" y="411" fill="#ded8f2" font-size="34">'+esc(points)+'</text>'+cards+'<text x="72" y="1230" fill="#ffdf70" font-size="28" font-weight="700">'+esc(thanks)+'</text><text x="72" y="1294" fill="white" fill-opacity=".75" font-size="25">queueup</text></svg>';
+  const file=new File([new Blob([svg],{type:'image/svg+xml'})],'queueup-season-recap.svg',{type:'image/svg+xml'});
+  try{if(navigator.canShare?.({files:[file]})){await navigator.share({title:season+' Recap',text:'My QueueUp season recap',files:[file]});return}}catch(error){if(error.name==='AbortError')return}
+  const link=document.createElement('a');link.href=URL.createObjectURL(file);link.download=file.name;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);
+ });
+});
+
 // Pull to refresh is intentionally limited to installed standalone PWAs.
 (() => {
  const standalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;

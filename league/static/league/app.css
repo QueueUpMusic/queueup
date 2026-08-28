@@ -113,6 +113,24 @@ html:has(.recap),body:has(.recap){width:100%;height:100%;overflow:hidden;overscr
 @media(max-width:520px){.recap .recap-slide{padding-left:max(14px,env(safe-area-inset-left));padding-right:max(14px,env(safe-area-inset-right))}.recap-song-feature{grid-template-columns:minmax(76px,min(29vw,23vh)) minmax(0,1fr)}.recap-song-feature.compact{grid-template-columns:minmax(70px,min(25vw,20vh)) minmax(0,1fr)}.recap-taste-grid{grid-template-columns:1fr 1fr}.recap-taste-song{grid-column:1/-1}.recap-controls button{width:40px;height:36px}}
 @media(prefers-reduced-motion:reduce){.recap-grid,.recap-orb{animation:none!important}.recap-slide.is-active .recap-copy *{animation:none!important;opacity:1!important;transform:none!important}}
 
+/* Final recap polish: more breathing room for song cards and a true title page. */
+.recap-song-feature{column-gap:clamp(20px,3.2vw,34px)}
+.recap-song-feature>div:last-child{display:grid;align-content:center;gap:clamp(5px,1vh,10px)}
+.recap-song-feature h2{line-height:1.02;letter-spacing:-.045em}
+.recap-song-feature p{line-height:1.24;letter-spacing:-.015em}
+.recap-voting .recap-rating{display:flex;align-items:flex-start;gap:clamp(13px,2vw,23px);letter-spacing:-.07em}
+.recap-voting .recap-rating span{font-size:.48em;line-height:.9;margin-top:.06em}
+.recap-intro .recap-copy{text-align:center;justify-items:center;max-width:min(940px,100%)}
+.recap-intro h1{max-width:12ch;font-size:clamp(56px,min(14vw,15vh),156px);line-height:.83;letter-spacing:-.085em}
+.recap-intro .recap-display{margin-top:clamp(10px,2.5vh,25px)}
+@keyframes recapTitleFlash{0%{opacity:0;transform:scale(.58) rotate(-4deg);filter:blur(10px);text-shadow:0 0 0 #ffdf70}55%{opacity:1;transform:scale(1.06) rotate(1deg);filter:blur(0);text-shadow:0 0 38px #ffdf70,0 0 72px #f65e95}100%{opacity:1;transform:none;filter:none;text-shadow:0 8px 30px rgba(246,94,149,.3)}}
+.recap-intro.is-active h1{animation:recapTitleFlash 1.05s cubic-bezier(.16,.9,.25,1) both .15s}
+.recap-share{justify-self:start;margin-top:clamp(8px,2vh,20px);border:1px solid rgba(255,223,112,.66);border-radius:999px;padding:11px 16px;background:#ffdf70;color:#24113b;font:800 14px/1 ui-rounded,"Avenir Next",system-ui,sans-serif;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+.recap-share:focus-visible{outline:3px solid #fff;outline-offset:3px}
+.recap-summary .recap-share{animation:recapCardIn .45s ease both .88s}
+@media(max-width:520px){.recap-song-feature{column-gap:18px}.recap-intro h1{font-size:clamp(54px,min(15vw,13vh),108px)}.recap-share{padding:9px 14px;font-size:13px}}
+@media(prefers-reduced-motion:reduce){.recap-intro.is-active h1{animation:none!important}}
+
 
 /* QueueUp v5.3 avatar presentation corrections */
 .user-avatar,
