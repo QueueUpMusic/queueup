@@ -23,7 +23,7 @@ from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from django.utils import timezone
 
-from .models import AchievementUnlock, Badge, NotificationDelivery, PushSubscription, Round, Season, SeasonWelcome, Submission, UserBadge, Vote
+from .models import AchievementUnlock, Badge, NotificationDelivery, PushSubscription, Round, Season, SeasonRecapView, SeasonWelcome, Submission, UserBadge, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
 from .services.ballots import ballot_for_user
 from .services.profiles import profile_for_user, profile_metrics as service_profile_metrics
@@ -4068,3 +4068,67 @@ class SeasonRecapTests(QueueUpTestMixin, TestCase):
         event = next(value for value in events if value.event_key.endswith(f':{self.alice.pk}'))
         self.assertEqual(event.url, reverse('season_recap', args=[self.season.pk]))
         self.assertEqual(event.event_key, f'season:{self.season.pk}:recap:{self.alice.pk}')
+
+    def test_home_banner_is_personal_and_opening_recap_marks_it_seen(self):
+        self.populated_recap()
+        self.client.force_login(self.alice)
+        home = self.client.get(reverse('home'))
+        self.assertContains(home, f'Your {self.season.name} recap is ready')
+
+        self.client.get(reverse('season_recap', args=[self.season.pk]))
+        self.assertTrue(SeasonRecapView.objects.filter(user=self.alice, season=self.season).exists())
+        self.assertNotContains(self.client.get(reverse('home')), f'Your {self.season.name} recap is ready')
+        self.assertEqual(self.client.get(reverse('season_recap', args=[self.season.pk])).status_code, 200)
+        self.assertEqual(SeasonRecapView.objects.filter(user=self.alice, season=self.season).count(), 1)
+
+        self.client.force_login(self.bob)
+        self.client.get(reverse('season_recap', args=[self.season.pk]))
+        self.assertTrue(SeasonRecapView.objects.filter(user=self.bob, season=self.season).exists())
+        self.assertEqual(SeasonRecapView.objects.filter(user=self.alice, season=self.season).count(), 1)
+
+    def test_home_banner_excludes_nonparticipants_and_unavailable_seasons(self):
+        self.populated_recap()
+        outsider = User.objects.create_user('recap-outsider', password='x')
+        outsider.profile.approved = True
+        outsider.profile.save(update_fields=['approved'])
+        self.client.force_login(outsider)
+        self.assertNotContains(self.client.get(reverse('home')), 'recap is ready')
+
+        self.season.ends_at = timezone.now() + timedelta(days=1)
+        self.season.save(update_fields=['ends_at'])
+        self.client.force_login(self.alice)
+        self.assertNotContains(self.client.get(reverse('home')), 'recap is ready')
+
+    def test_home_prefers_most_recent_unseen_recap(self):
+        self.populated_recap()
+        now = timezone.now()
+        newer = Season.objects.create(name='Newer Season', starts_at=now - timedelta(days=4), ends_at=now - timedelta(minutes=1), active=False)
+        newer_round = Round.objects.create(
+            season=newer, prompt='New prompt', submission_opens=now - timedelta(days=3),
+            submission_deadline=now - timedelta(days=2), voting_deadline=now - timedelta(days=1), reveal_at=now - timedelta(hours=2),
+        )
+        Submission.objects.create(round=newer_round, user=self.alice, spotify_track_id='newer', spotify_uri='spotify:track:newer', spotify_url='https://spotify.test/newer', title='Newer', artist='Artist')
+        self.client.force_login(self.alice)
+        self.assertContains(self.client.get(reverse('home')), 'Your Newer Season recap is ready')
+        SeasonRecapView.objects.create(user=self.alice, season=newer)
+        self.assertContains(self.client.get(reverse('home')), f'Your {self.season.name} recap is ready')
+
+    def test_archive_selects_a_season_filters_rounds_and_keeps_recap_access(self):
+        self.populated_recap()
+        now = timezone.now()
+        other = Season.objects.create(name='Older Season', starts_at=now - timedelta(days=30), ends_at=now - timedelta(days=20), active=False)
+        other_round = Round.objects.create(
+            season=other, prompt='Older prompt', submission_opens=now - timedelta(days=29),
+            submission_deadline=now - timedelta(days=28), voting_deadline=now - timedelta(days=27), reveal_at=now - timedelta(days=26),
+        )
+        self.client.force_login(self.alice)
+        archive = self.client.get(reverse('archive'), {'season': self.season.pk})
+        self.assertContains(archive, self.round.prompt)
+        self.assertNotContains(archive, other_round.prompt)
+        self.assertContains(archive, f'View your {self.season.name} Recap')
+        SeasonRecapView.objects.create(user=self.alice, season=self.season)
+        self.assertContains(self.client.get(reverse('archive'), {'season': self.season.pk}), f'View your {self.season.name} Recap')
+        older = self.client.get(reverse('archive'), {'season': other.pk})
+        self.assertContains(older, other_round.prompt)
+        self.assertNotContains(older, self.round.prompt)
+        self.assertNotContains(older, 'View your Older Season Recap')

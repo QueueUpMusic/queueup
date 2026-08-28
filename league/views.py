@@ -29,8 +29,8 @@ from .spotify import exchange_code, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
 from .services.recaps import (
-    RecapUnavailable, recap_eligible_user_ids, recap_is_available,
-    season_recap_for_user,
+    RecapUnavailable, mark_recap_viewed, most_recent_unseen_recap_for_user,
+    season_recap_for_user, user_has_recap,
 )
 from .services.spotify_search import search_tracks
 from .services.profiles import profile_for_user
@@ -88,12 +88,7 @@ def home(request):
     current, results_round = homepage_rounds()
 
     submission = Submission.objects.filter(round=current, user=request.user).first() if current else None
-    recap_season = Season.objects.filter(ends_at__lte=timezone.now()).order_by('-ends_at').first()
-    if recap_season and (
-        not recap_is_available(recap_season)
-        or request.user.id not in recap_eligible_user_ids(recap_season)
-    ):
-        recap_season = None
+    recap_season = most_recent_unseen_recap_for_user(request.user)
     return render(request, 'league/home.html', {
         'round': current,
         'results_round': results_round,
@@ -111,6 +106,7 @@ def season_recap(request, pk):
         recap = season_recap_for_user(season, request.user)
     except RecapUnavailable:
         return HttpResponse(status=404)
+    mark_recap_viewed(season, request.user)
     return render(request, 'league/season_recap.html', {'recap': recap})
 
 
@@ -370,8 +366,21 @@ def remove_profile_picture(request):
 
 @login_required
 def archive(request):
+    now = timezone.now()
+    all_rounds = revealed_rounds_for_archive(now=now).select_related('season').prefetch_related('submissions')
+    seasons = Season.objects.filter(
+        rounds__is_draft=False,
+        rounds__reveal_at__lte=now,
+    ).distinct().order_by('-starts_at', '-id')
+    selected_season = seasons.filter(pk=request.GET.get('season')).first() if request.GET.get('season') else None
+    if selected_season is None:
+        selected_season = seasons.filter(active=True).first() or seasons.first()
+    rounds = all_rounds.filter(season=selected_season) if selected_season else all_rounds.none()
     return render(request, 'league/archive.html', {
-        'rounds': revealed_rounds_for_archive(),
+        'rounds': rounds,
+        'seasons': seasons,
+        'selected_season': selected_season,
+        'recap_available': bool(selected_season and user_has_recap(selected_season, request.user, now=now)),
     })
 
 

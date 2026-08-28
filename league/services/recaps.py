@@ -10,7 +10,7 @@ from django.db.models import Avg
 from django.utils import timezone
 
 from ..genres import main_genre
-from ..models import Season, Submission, Vote
+from ..models import Season, SeasonRecapView, Submission, Vote
 from ..ranking import ranked_submissions
 from ..voting import counted_vote_ids_for_rounds
 from .scoring import season_leaderboard
@@ -45,6 +45,30 @@ def recap_eligible_user_ids(season, now=None):
     submitted = set(Submission.objects.filter(round__in=rounds).values_list('user_id', flat=True))
     voted = set(Vote.objects.filter(id__in=counted_ids).values_list('voter_id', flat=True))
     return submitted | voted
+
+
+def user_has_recap(season, user, now=None):
+    """Whether this user can open a personal recap for this season."""
+    return user.id in recap_eligible_user_ids(season, now=now)
+
+
+def recap_has_been_viewed(season, user):
+    return SeasonRecapView.objects.filter(season=season, user=user).exists()
+
+
+def mark_recap_viewed(season, user):
+    """Persist a successful recap opening; safe to call on every page load."""
+    return SeasonRecapView.objects.get_or_create(season=season, user=user)
+
+
+def most_recent_unseen_recap_for_user(user, now=None):
+    """Return one banner-worthy recap, newest first, without stacking banners."""
+    now = now or timezone.now()
+    viewed_season_ids = SeasonRecapView.objects.filter(user=user).values_list('season_id', flat=True)
+    for season in Season.objects.filter(ends_at__lte=now).exclude(pk__in=viewed_season_ids).order_by('-ends_at', '-id'):
+        if user_has_recap(season, user, now=now):
+            return season
+    return None
 
 
 def _ordinal(place):
