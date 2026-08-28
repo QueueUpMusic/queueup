@@ -6,6 +6,7 @@ from league.push import send_push, send_user_push
 from league.services.notifications import (
     achievement_notification_events,
     global_notification_audience,
+    recap_notification_events,
     round_notification_events,
 )
 
@@ -53,6 +54,9 @@ class Command(BaseCommand):
             if result['sent'] and not event.unlock.notification_sent_at:
                 event.unlock.notification_sent_at = now
                 event.unlock.save(update_fields=['notification_sent_at'])
+
+        for event in recap_notification_events(now):
+            merge(self.send(event.subscriptions, event.event_key, event.title, event.body, event.url))
 
         self.stdout.write(self.style.SUCCESS(
             'QueueUp notification check complete: '

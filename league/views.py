@@ -28,6 +28,10 @@ from .models import Badge, Round, Season, SpotifyConnection, Submission, UserPro
 from .spotify import exchange_code, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
+from .services.recaps import (
+    RecapUnavailable, recap_eligible_user_ids, recap_is_available,
+    season_recap_for_user,
+)
 from .services.spotify_search import search_tracks
 from .services.profiles import profile_for_user
 from .services import rounds as round_service
@@ -84,12 +88,30 @@ def home(request):
     current, results_round = homepage_rounds()
 
     submission = Submission.objects.filter(round=current, user=request.user).first() if current else None
+    recap_season = Season.objects.filter(ends_at__lte=timezone.now()).order_by('-ends_at').first()
+    if recap_season and (
+        not recap_is_available(recap_season)
+        or request.user.id not in recap_eligible_user_ids(recap_season)
+    ):
+        recap_season = None
     return render(request, 'league/home.html', {
         'round': current,
         'results_round': results_round,
         'submission': submission,
         'current_first': bool(current and current.state != 'upcoming'),
+        'recap_season': recap_season,
     })
+
+
+@login_required
+@never_cache
+def season_recap(request, pk):
+    season = get_object_or_404(Season, pk=pk)
+    try:
+        recap = season_recap_for_user(season, request.user)
+    except RecapUnavailable:
+        return HttpResponse(status=404)
+    return render(request, 'league/season_recap.html', {'recap': recap})
 
 
 @login_required

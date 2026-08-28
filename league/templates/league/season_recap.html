@@ -1,0 +1,37 @@
+{% extends 'league/base.html' %}
+{% block title %}{{ recap.season.name }} Recap · QueueUp{% endblock %}
+{% block content %}
+<section class="recap" data-recap aria-label="{{ recap.season.name }} personal season recap">
+  <a class="recap-exit" href="{% url 'home' %}">← Back to QueueUp</a>
+  <div class="recap-progress" aria-label="Recap progress">{% for slide in recap.slides %}<span{% if forloop.first %} class="is-active"{% endif %}></span>{% endfor %}</div>
+  <div class="recap-slides">
+  {% for slide in recap.slides %}
+    <article class="recap-slide recap-{{ slide.kind }}{% if forloop.first %} is-active{% endif %}" data-recap-slide aria-hidden="{% if forloop.first %}false{% else %}true{% endif %}">
+      <div class="recap-orb recap-orb-a"></div><div class="recap-orb recap-orb-b"></div><div class="recap-grid"></div>
+      <div class="recap-copy">
+      {% if slide.kind == 'intro' %}
+        <p class="recap-kicker">Your QueueUp season</p><h1>{{ recap.season.name }}</h1><p class="recap-display">{{ slide.round_count }} rounds.<br>{{ slide.song_count }} songs.<br><em>One season.</em></p>
+      {% elif slide.kind == 'standing' %}
+        <p class="recap-kicker">Final standing</p><p class="recap-overline">You finished</p><div class="recap-place">#{{ slide.place }}</div><p class="recap-lede">of {{ slide.league_size }} players · {{ slide.points }} points</p><div class="recap-stat-row">{% if slide.podiums %}<span><b>{{ slide.podiums }}</b> podium{{ slide.podiums|pluralize }}</span>{% endif %}{% if slide.wins %}<span><b>{{ slide.wins }}</b> win{{ slide.wins|pluralize }}</span>{% endif %}{% if slide.played %}<span><b>{{ slide.top_half }}/{{ slide.played }}</b> top half</span>{% endif %}</div>
+      {% elif slide.kind == 'best_submission' %}
+        <p class="recap-kicker">Your biggest hit</p><div class="recap-song-feature">{% if slide.song.art %}<img src="{{ slide.song.art }}" alt="Album art for {{ slide.song.title }}">{% else %}<div class="recap-art-fallback" aria-label="No album art available">♫</div>{% endif %}<div><h2>{{ slide.song.title }}</h2><p>{{ slide.song.artist }}</p><small>{{ slide.song.prompt }}</small></div></div><div class="recap-score"><b>{{ slide.song.place_label }}</b><span>{{ slide.song.average }} ★ counted average</span></div>
+      {% elif slide.kind == 'taste' %}
+        <p class="recap-kicker">Your music taste</p><div class="recap-taste-grid">{% if slide.favorite_artist %}<div><small>Favorite artist</small><h2>{{ slide.favorite_artist }}</h2></div>{% endif %}{% if slide.favorite_genre %}<div><small>Favorite genre</small><h2>{{ slide.favorite_genre }}</h2></div>{% endif %}{% if slide.song %}<div class="recap-taste-song">{% if slide.song.art %}<img src="{{ slide.song.art }}" alt="Album art for {{ slide.song.title }}">{% endif %}<small>Your song of the season</small><strong>{{ slide.song.title }}</strong><span>{{ slide.song.artist }}</span></div>{% endif %}</div>
+      {% elif slide.kind == 'voting' %}
+        <p class="recap-kicker">Voting personality</p><p class="recap-overline">You gave an average of</p><div class="recap-rating">{{ slide.average }}<span>★</span></div><p class="recap-lede">League average: {{ slide.league_average }} ★</p><div class="recap-stat-row"><span><b>{{ slide.ratings }}</b> counted ratings</span><span><b>{{ slide.five_stars }}</b> five-star picks</span></div>{% if slide.personality %}<p class="recap-personality">{{ slide.personality }}</p>{% endif %}
+      {% elif slide.kind == 'story' %}
+        <p class="recap-kicker">Your season story</p><p class="recap-overline">Your best finish was</p><h2 class="recap-giant">{{ slide.best_finish }}</h2><p class="recap-lede">in “{{ slide.round_prompt }}”</p><p class="recap-display small">You landed in the top half in {{ slide.top_half }} of {{ slide.played }} rounds.</p>
+      {% elif slide.kind == 'chaos' %}
+        <p class="recap-kicker">The chaos card</p><p class="recap-overline">Your most divisive pick</p><div class="recap-song-feature compact">{% if slide.song.art %}<img src="{{ slide.song.art }}" alt="Album art for {{ slide.song.title }}">{% endif %}<div><h2>{{ slide.song.title }}</h2><p>{{ slide.song.artist }}</p></div></div><div class="recap-range"><span>{{ slide.song.low }} ★</span><i></i><span>{{ slide.song.high }} ★</span></div><p class="recap-lede">That is a {{ slide.song.low }}–{{ slide.song.high }} ★ spread from counted ballots.</p>
+      {% elif slide.kind == 'league' %}
+        <p class="recap-kicker">The league season</p><div class="recap-league-numbers"><div><b>{{ slide.song_count }}</b><span>songs submitted</span></div><div><b>{{ slide.rating_count }}</b><span>counted ratings</span></div><div><b>{{ slide.round_count }}</b><span>rounds played</span></div></div>{% if slide.top_song %}<p class="recap-overline">Season's top song</p><h2>{{ slide.top_song.title }}</h2><p class="recap-lede">{{ slide.top_song.artist }} · {{ slide.top_song.average }} ★ average</p>{% endif %}
+      {% elif slide.kind == 'summary' %}
+        <p class="recap-kicker">QueueUp season recap</p>{% if slide.standing %}<h2 class="recap-summary-place">#{{ slide.standing.place }} overall</h2><p class="recap-lede">{{ slide.standing.item.total_score }} points</p>{% endif %}<div class="recap-summary-grid">{% if slide.song_of_season %}<div><small>Song of the season</small><strong>{{ slide.song_of_season.title }}</strong><span>{{ slide.song_of_season.artist }}</span></div>{% endif %}{% if slide.favorite_artist %}<div><small>Favorite artist</small><strong>{{ slide.favorite_artist }}</strong></div>{% endif %}{% if slide.best_submission %}<div><small>Best submission</small><strong>{{ slide.best_submission.title }}</strong><span>{{ slide.best_submission.artist }}</span></div>{% endif %}</div><p class="recap-thanks">{{ slide.podiums }} podium{{ slide.podiums|pluralize }} · {{ slide.wins }} win{{ slide.wins|pluralize }} · {{ slide.round_count }} rounds played<br>Thanks for playing.</p>
+      {% endif %}
+      </div>
+    </article>
+  {% endfor %}
+  </div>
+  <div class="recap-controls"><button type="button" data-recap-prev aria-label="Previous recap slide">←</button><span data-recap-count>1 / {{ recap.slides|length }}</span><button type="button" data-recap-next aria-label="Next recap slide">→</button></div>
+</section>
+{% endblock %}

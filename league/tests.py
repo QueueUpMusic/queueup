@@ -34,6 +34,8 @@ from .services.notifications import (
     voting_reminder_audience,
 )
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
+from .services.recaps import RecapUnavailable, recap_is_available, season_recap_for_user
+from .services.notifications import recap_notification_events
 from .services import votes as vote_service
 from .voting import voting_progress
 
@@ -2129,6 +2131,65 @@ class NotificationTests(QueueUpTestMixin, TestCase):
         )
         self.assertEqual(len(live_calls), 3)
 
+    @patch('league.push.webpush')
+    def test_recap_scheduler_is_per_device_idempotent_and_participant_only(self, mocked_push):
+        """Exercise the command, not just the recap event factory."""
+        now = timezone.now()
+        self.season.ends_at = now - timedelta(hours=1)
+        self.season.save(update_fields=['ends_at'])
+        self.round.voting_deadline = now - timedelta(days=2)
+        self.round.reveal_at = now - timedelta(days=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+        self.submission(self.alice, 'recap-participant')
+
+        call_command('send_round_notifications')
+        recap_key = f'season:{self.season.pk}:recap:{self.alice.pk}'
+        recap_calls = [
+            call for call in mocked_push.call_args_list
+            if recap_key in call.kwargs['data']
+        ]
+        self.assertEqual(
+            {call.kwargs['subscription_info']['endpoint'] for call in recap_calls},
+            {'https://push/a1', 'https://push/a2'},
+        )
+        self.assertTrue(all(
+            f'/seasons/{self.season.pk}/recap/' in call.kwargs['data']
+            for call in recap_calls
+        ))
+        self.assertFalse(any(
+            'season:' in call.kwargs['data'] and 'https://push/b1' == call.kwargs['subscription_info']['endpoint']
+            for call in mocked_push.call_args_list
+        ))
+        self.assertEqual(
+            NotificationDelivery.objects.filter(event_key=recap_key).count(), 2,
+        )
+
+        call_command('send_round_notifications')
+        self.assertEqual(len([
+            call for call in mocked_push.call_args_list if recap_key in call.kwargs['data']
+        ]), 2)
+
+        future = Season.objects.create(
+            name='Not finished', starts_at=now - timedelta(days=1),
+            ends_at=now + timedelta(days=1),
+        )
+        future_round = Round.objects.create(
+            season=future, prompt='Still secret',
+            submission_opens=now - timedelta(days=2),
+            submission_deadline=now - timedelta(days=1),
+            voting_deadline=now - timedelta(hours=1),
+            reveal_at=now + timedelta(hours=1),
+        )
+        Submission.objects.create(
+            round=future_round, user=self.alice, spotify_track_id='future',
+            spotify_uri='spotify:track:future', spotify_url='https://spotify.test/future',
+            title='Future', artist='Artist',
+        )
+        call_command('send_round_notifications')
+        self.assertFalse(NotificationDelivery.objects.filter(
+            event_key=f'season:{future.pk}:recap:{self.alice.pk}',
+        ).exists())
+
 
 class V70MembershipTests(TestCase):
     def test_new_signup_waits_for_approval(self):
@@ -3915,3 +3976,95 @@ class AdminManagementAndSubmissionBonusTests(QueueUpTestMixin, TestCase):
         alice = next(entry.item for entry in response.context['players'] if entry.item.pk == self.alice.pk)
         self.assertEqual(alice.submission_bonus, 4)
         self.assertEqual(alice.total_score, 4)
+
+
+class SeasonRecapTests(QueueUpTestMixin, TestCase):
+    def reveal_season(self):
+        now = timezone.now()
+        self.season.ends_at = now - timedelta(hours=1)
+        self.season.save(update_fields=['ends_at'])
+        self.round.voting_deadline = now - timedelta(days=2)
+        self.round.reveal_at = now - timedelta(days=1)
+        self.round.save(update_fields=['voting_deadline', 'reveal_at'])
+
+    def add_submission(self, user, title, artist, genres=None):
+        return Submission.objects.create(
+            round=self.round, user=user, spotify_track_id=title,
+            spotify_uri=f'spotify:track:{title}', spotify_url=f'https://spotify.test/{title}',
+            title=title, artist=artist, genres=genres or [],
+        )
+
+    def complete_votes(self, alice_song, bob_song, cara_song):
+        # Alice is deliberately generous, and never votes for her own song.
+        for song, score in ((bob_song, 5), (cara_song, 4)):
+            Vote.objects.create(round=self.round, voter=self.alice, submission=song, score=score)
+        for song, score in ((alice_song, 5), (cara_song, 2)):
+            Vote.objects.create(round=self.round, voter=self.bob, submission=song, score=score)
+        for song, score in ((alice_song, 4), (bob_song, 3)):
+            Vote.objects.create(round=self.round, voter=self.cara, submission=song, score=score)
+
+    def populated_recap(self):
+        alice_song = self.add_submission(self.alice, 'A very long personal song title', 'Alice Artist', ['alternative rock'])
+        bob_song = self.add_submission(self.bob, 'Bob Song', 'Repeated Artist', ['christian hip hop'])
+        cara_song = self.add_submission(self.cara, 'Cara Song', 'Repeated Artist', ['dance pop'])
+        self.complete_votes(alice_song, bob_song, cara_song)
+        self.reveal_season()
+        return season_recap_for_user(self.season, self.alice)
+
+    def test_recap_is_unavailable_before_the_season_ends_or_round_reveals(self):
+        self.assertFalse(recap_is_available(self.season))
+        self.season.ends_at = timezone.now() - timedelta(minutes=1)
+        self.season.save(update_fields=['ends_at'])
+        self.assertFalse(recap_is_available(self.season))
+        with self.assertRaises(RecapUnavailable):
+            season_recap_for_user(self.season, self.alice)
+
+    def test_recap_uses_authoritative_standing_and_has_at_most_ten_slides(self):
+        recap = self.populated_recap()
+        standing = next(row for row in season_leaderboard(self.season) if row.item == self.alice)
+        standing_slide = next(slide for slide in recap.slides if slide['kind'] == 'standing')
+        self.assertEqual(standing_slide['place'], standing.place)
+        self.assertEqual(standing_slide['points'], standing.item.total_score)
+        self.assertLessEqual(len(recap.slides), 10)
+        self.assertEqual(recap.slides[-1]['kind'], 'summary')
+
+    def test_incomplete_ballots_and_own_submissions_do_not_affect_taste_or_results(self):
+        recap = self.populated_recap()
+        alice_song = Submission.objects.get(round=self.round, user=self.alice)
+        bob_song = Submission.objects.get(round=self.round, user=self.bob)
+        # This would change both taste and Alice's received result if partial votes counted.
+        partial = User.objects.create_user('partial-recap', password='x')
+        partial.profile.approved = True
+        partial.profile.save(update_fields=['approved'])
+        Vote.objects.create(round=self.round, voter=partial, submission=alice_song, score=1)
+        Vote.objects.create(round=self.round, voter=partial, submission=bob_song, score=1)
+        updated = season_recap_for_user(self.season, self.alice)
+        taste = next(slide for slide in updated.slides if slide['kind'] == 'taste')
+        best = next(slide for slide in updated.slides if slide['kind'] == 'best_submission')
+        self.assertEqual(taste['song']['title'], 'Bob Song')
+        self.assertEqual(best['song']['average'], 4.5)
+        self.assertEqual(recap.summary['best_submission'].pk, updated.summary['best_submission'].pk)
+
+    def test_favorite_artist_and_genre_are_normalized_and_deterministic(self):
+        recap = self.populated_recap()
+        taste = next(slide for slide in recap.slides if slide['kind'] == 'taste')
+        self.assertEqual(taste['favorite_artist'], 'Repeated Artist')
+        self.assertEqual(taste['favorite_genre'], 'Hip Hop')
+
+    def test_route_is_personal_and_pending_users_are_redirected(self):
+        self.populated_recap()
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('season_recap', args=[self.season.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'Your QueueUp season')
+        pending = User.objects.create_user('pending-recap', password='x')
+        self.client.force_login(pending)
+        response = self.client.get(reverse('season_recap', args=[self.season.pk]))
+        self.assertRedirects(response, reverse('waiting_approval'), fetch_redirect_response=False)
+
+    def test_recap_push_events_are_eligible_and_idempotent_by_event_key(self):
+        self.populated_recap()
+        events = list(recap_notification_events(timezone.now()))
+        event = next(value for value in events if value.event_key.endswith(f':{self.alice.pk}'))
+        self.assertEqual(event.url, reverse('season_recap', args=[self.season.pk]))
+        self.assertEqual(event.event_key, f'season:{self.season.pk}:recap:{self.alice.pk}')

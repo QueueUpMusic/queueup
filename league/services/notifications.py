@@ -4,7 +4,8 @@ from datetime import timedelta
 from django.contrib.auth.models import User
 from django.db import models
 
-from ..models import AchievementUnlock, PushSubscription, Submission
+from ..models import AchievementUnlock, PushSubscription, Submission, Season
+from .recaps import recap_eligible_user_ids
 from .achievements import earned_badges
 from .ballots import ballot_for_user
 
@@ -175,4 +176,20 @@ def achievement_notification_events():
                 badge['description'],
                 f'/stats/{user.username}/',
                 unlock,
+            )
+
+
+def recap_notification_events(now):
+    """Yield one idempotent recap push per eligible participant and season."""
+    for season in Season.objects.filter(ends_at__lte=now).order_by('id'):
+        for user in User.objects.filter(
+            id__in=recap_eligible_user_ids(season, now=now), is_active=True,
+            profile__approved=True,
+        ).iterator():
+            yield PushNotificationEvent(
+                PushSubscription.objects.filter(user=user),
+                f'season:{season.pk}:recap:{user.pk}',
+                'Your QueueUp Season Recap is ready',
+                'Check out your season recap.',
+                f'/seasons/{season.pk}/recap/',
             )
