@@ -4028,6 +4028,23 @@ class SeasonRecapTests(QueueUpTestMixin, TestCase):
         self.assertLessEqual(len(recap.slides), 10)
         self.assertEqual(recap.slides[-1]['kind'], 'summary')
 
+    def test_summary_counts_only_rounds_the_user_played(self):
+        self.populated_recap()
+        extra_round = Round.objects.create(
+            season=self.season, prompt='Skipped round',
+            submission_opens=timezone.now() - timedelta(days=4),
+            submission_deadline=timezone.now() - timedelta(days=3),
+            voting_deadline=timezone.now() - timedelta(days=2),
+            reveal_at=timezone.now() - timedelta(days=1),
+        )
+        submission = self.add_submission(self.bob, 'Unused', 'Artist')
+        submission.round = extra_round
+        submission.save(update_fields=['round'])
+
+        recap = season_recap_for_user(self.season, self.alice)
+
+        self.assertEqual(recap.summary['round_count'], 1)
+
     def test_incomplete_ballots_and_own_submissions_do_not_affect_taste_or_results(self):
         recap = self.populated_recap()
         alice_song = Submission.objects.get(round=self.round, user=self.alice)
@@ -4068,6 +4085,16 @@ class SeasonRecapTests(QueueUpTestMixin, TestCase):
         event = next(value for value in events if value.event_key.endswith(f':{self.alice.pk}'))
         self.assertEqual(event.url, reverse('season_recap', args=[self.season.pk]))
         self.assertEqual(event.event_key, f'season:{self.season.pk}:recap:{self.alice.pk}')
+
+    def test_recap_push_events_skip_historical_seasons(self):
+        self.populated_recap()
+        old = timezone.now() - timedelta(days=30)
+        self.season.ends_at = old
+        self.season.save(update_fields=['ends_at'])
+        self.round.reveal_at = old
+        self.round.save(update_fields=['reveal_at'])
+
+        self.assertEqual(list(recap_notification_events(timezone.now())), [])
 
     def test_home_banner_is_personal_and_opening_recap_marks_it_seen(self):
         self.populated_recap()

@@ -11,6 +11,7 @@ from .ballots import ballot_for_user
 
 
 REMINDER_WINDOW = timedelta(hours=6)
+RECAP_NOTIFICATION_WINDOW = timedelta(hours=6)
 
 
 class InvalidPushSubscription(Exception):
@@ -180,8 +181,13 @@ def achievement_notification_events():
 
 
 def recap_notification_events(now):
-    """Yield one idempotent recap push per eligible participant and season."""
-    for season in Season.objects.filter(ends_at__lte=now).order_by('id'):
+    """Yield recap pushes only when a season's recap has recently become available."""
+    cutoff = now - RECAP_NOTIFICATION_WINDOW
+    seasons = Season.objects.filter(ends_at__lte=now).filter(
+        models.Q(ends_at__gt=cutoff)
+        | models.Q(rounds__reveal_at__gt=cutoff, rounds__reveal_at__lte=now)
+    ).distinct().order_by('id')
+    for season in seasons:
         for user in User.objects.filter(
             id__in=recap_eligible_user_ids(season, now=now), is_active=True,
             profile__approved=True,

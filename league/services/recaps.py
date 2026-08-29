@@ -207,6 +207,6 @@ def season_recap_for_user(season, user, now=None):
     summary = {'standing': standing, 'best_submission': best_submission[0] if best_submission else None,
                'song_of_season': song_of_season[0] if song_of_season else None,
                'favorite_artist': favorite_artist[0] if favorite_artist else None,
-               'podiums': podiums, 'wins': wins, 'round_count': len(rounds)}
+               'podiums': podiums, 'wins': wins, 'round_count': len(submission_results)}
     slides.append({'kind': 'summary', **summary})
     return SeasonRecap(season=season, slides=slides[:10], summary=summary)
