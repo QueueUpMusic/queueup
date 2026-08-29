@@ -34,6 +34,7 @@ urlpatterns = [
         template_name='league/password_reset_complete.html',
     ), name='password_reset_complete'),
     path('home/', views.home, name='home'),
+    path('seasons/<int:pk>/recap/', views.season_recap, name='season_recap'),
     path('round/<int:pk>/', views.round_detail, name='round_detail'),
     path('round/<int:pk>/songs/', views.song_picker, name='song_picker'),
     path('api/spotify/search/', views.spotify_search, name='spotify_search'),

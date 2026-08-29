@@ -39,6 +39,16 @@ class SeasonWelcome(models.Model):
         constraints = [models.UniqueConstraint(fields=['user', 'season'], name='one_welcome_per_user_season')]
 
 
+class SeasonRecapView(models.Model):
+    """Records that a player opened one personal season recap."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='season_recap_views')
+    season = models.ForeignKey(Season, on_delete=models.CASCADE, related_name='recap_views')
+    viewed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['user', 'season'], name='one_recap_view_per_user_season')]
+
+
 class Badge(models.Model):
     name = models.CharField(max_length=80)
     slug = models.SlugField(max_length=80, unique=True)
