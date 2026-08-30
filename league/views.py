@@ -21,10 +21,10 @@ from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.cache import never_cache
 
-from .forms import BadgeForm, ProfileForm, ProfilePictureForm, RoundForm, SeasonForm, SignupForm, VoteForm
+from .forms import BadgeForm, HomepageCountdownForm, NotificationBlastForm, ProfileForm, ProfilePictureForm, RoundForm, SeasonForm, SignupForm, VoteForm
 from .services.achievements import earned_badges, prestige_badges
 from .realtime import broadcast
-from .models import Badge, Round, Season, SpotifyConnection, Submission, UserProfile, Vote
+from .models import Badge, HomepageCountdown, NotificationBlast, Round, Season, SpotifyConnection, Submission, UserProfile, Vote
 from .spotify import exchange_code, spotify_authorize_url, user_api
 from .services.rounds import homepage_rounds, revealed_rounds_for_archive, round_detail_for_user
 from .services.scoring import SUBMISSION_BONUS_POINTS, season_leaderboard
@@ -40,6 +40,8 @@ from .services import staff as staff_service
 from .services import badges as badge_service
 from .services import membership as membership_service
 from .services import notifications as notification_service
+from .services import countdowns as countdown_service
+from .services import notification_blasts as blast_service
 from .services import media as media_service
 from .services import submissions as submission_service
 from .services import votes as vote_service
@@ -89,12 +91,14 @@ def home(request):
 
     submission = Submission.objects.filter(round=current, user=request.user).first() if current else None
     recap_season = most_recent_unseen_recap_for_user(request.user)
+    countdown = countdown_service.active_homepage_countdown()
     return render(request, 'league/home.html', {
         'round': current,
         'results_round': results_round,
         'submission': submission,
         'current_first': bool(current and current.state != 'upcoming'),
         'recap_season': recap_season,
+        'countdown': countdown,
     })
 
 
@@ -465,6 +469,131 @@ def control_users(request):
         'users': users,
         'query': query,
     })
+
+
+@staff_required
+def control_countdowns(request):
+    countdowns = HomepageCountdown.objects.select_related('created_by').all()
+    return render(request, 'league/control_countdowns.html', {'countdowns': countdowns})
+
+
+@staff_required
+def countdown_create(request):
+    form = HomepageCountdownForm(request.POST or None)
+    if request.method == 'POST' and form.is_valid():
+        countdown = form.save(commit=False)
+        countdown.created_by = request.user
+        countdown.save()
+        messages.success(request, 'Countdown created.')
+        return redirect('control_countdowns')
+    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Create countdown', 'back_url': reverse('control_countdowns')})
+
+
+@staff_required
+def countdown_edit(request, pk):
+    countdown = get_object_or_404(HomepageCountdown, pk=pk)
+    form = HomepageCountdownForm(request.POST or None, instance=countdown)
+    if request.method == 'POST' and form.is_valid():
+        form.save()
+        messages.success(request, 'Countdown updated.')
+        return redirect('control_countdowns')
+    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Edit countdown', 'back_url': reverse('control_countdowns')})
+
+
+@staff_required
+@require_POST
+def countdown_action(request, pk, action):
+    countdown = get_object_or_404(HomepageCountdown, pk=pk)
+    if action == 'delete':
+        countdown.delete()
+        messages.success(request, 'Countdown deleted.')
+    elif action in ('activate', 'deactivate'):
+        countdown.active = action == 'activate'
+        countdown.save(update_fields=['active', 'updated_at'])
+        messages.success(request, f'Countdown {action}d.')
+    else:
+        return HttpResponseBadRequest('Unknown countdown action')
+    return redirect('control_countdowns')
+
+
+@staff_required
+def control_notifications(request):
+    blasts = NotificationBlast.objects.select_related('created_by').all()
+    return render(request, 'league/control_notifications.html', {'blasts': blasts})
+
+
+@staff_required
+def notification_create(request):
+    form = NotificationBlastForm(request.POST or None)
+    if request.method == 'POST' and form.is_valid():
+        blast = form.save(commit=False)
+        blast.created_by = request.user
+        if request.POST.get('action') == 'send_now':
+            blast.scheduled_for = None
+            blast.status = NotificationBlast.Status.DRAFT
+            blast.save()
+            return redirect('notification_confirm', pk=blast.pk)
+        if blast.scheduled_for:
+            blast.status = NotificationBlast.Status.SCHEDULED
+            blast.save()
+            messages.success(request, 'Notification scheduled.')
+            return redirect('control_notifications')
+        form.add_error('scheduled_for', 'Choose a future date and time, or use Send now.')
+    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Create notification', 'back_url': reverse('control_notifications'), 'notification_form': True})
+
+
+@staff_required
+def notification_edit(request, pk):
+    blast = get_object_or_404(NotificationBlast, pk=pk)
+    if blast.status != NotificationBlast.Status.SCHEDULED:
+        messages.error(request, 'Only scheduled notifications can be edited.')
+        return redirect('control_notifications')
+    form = NotificationBlastForm(request.POST or None, instance=blast)
+    if request.method == 'POST' and form.is_valid():
+        updated = form.save(commit=False)
+        if request.POST.get('action') == 'send_now':
+            updated.scheduled_for = None
+            updated.status = NotificationBlast.Status.DRAFT
+        elif updated.scheduled_for:
+            updated.status = NotificationBlast.Status.SCHEDULED
+        else:
+            form.add_error('scheduled_for', 'Choose a future date and time, or use Send now.')
+            return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Edit scheduled notification', 'back_url': reverse('control_notifications'), 'notification_form': True})
+        updated.save()
+        if updated.status == NotificationBlast.Status.DRAFT:
+            return redirect('notification_confirm', pk=updated.pk)
+        messages.success(request, 'Scheduled notification updated.')
+        return redirect('control_notifications')
+    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Edit scheduled notification', 'back_url': reverse('control_notifications'), 'notification_form': True})
+
+
+@staff_required
+def notification_confirm(request, pk):
+    blast = get_object_or_404(NotificationBlast, pk=pk)
+    if blast.status != NotificationBlast.Status.DRAFT:
+        return redirect('control_notifications')
+    if request.method == 'POST':
+        result = blast_service.send_now(blast)
+        messages.success(request, f'Notification sent to {result["sent"]} device(s).')
+        return redirect('control_notifications')
+    return render(request, 'league/notification_confirm.html', {'blast': blast})
+
+
+@staff_required
+@require_POST
+def notification_action(request, pk, action):
+    blast = get_object_or_404(NotificationBlast, pk=pk)
+    if action == 'cancel' and blast.status == NotificationBlast.Status.SCHEDULED:
+        blast.status = NotificationBlast.Status.CANCELLED
+        blast.save(update_fields=['status'])
+        messages.success(request, 'Notification cancelled.')
+    elif action == 'send' and blast.status == NotificationBlast.Status.SCHEDULED:
+        blast.status = NotificationBlast.Status.DRAFT
+        blast.save(update_fields=['status'])
+        return redirect('notification_confirm', pk=blast.pk)
+    else:
+        return HttpResponseBadRequest('Unknown or unavailable notification action')
+    return redirect('control_notifications')
 
 
 @staff_required

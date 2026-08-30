@@ -1,8 +1,9 @@
 from django import forms
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.auth.models import User
+from django.utils import timezone
 
-from .models import Badge, Round, Season, UserProfile, Vote
+from .models import Badge, HomepageCountdown, NotificationBlast, Round, Season, UserProfile, Vote
 from .services.media import validate_profile_picture
 
 
@@ -99,3 +100,44 @@ class BadgeForm(forms.ModelForm):
     class Meta:
         model = Badge
         fields = ['name', 'slug', 'description', 'icon', 'achievement_key', 'hidden', 'display_next_to_name', 'active', 'sort_order']
+
+
+class HomepageCountdownForm(forms.ModelForm):
+    class Meta:
+        model = HomepageCountdown
+        fields = ['title', 'target_at', 'active']
+        widgets = {'target_at': forms.DateTimeInput(attrs={'type': 'datetime-local'})}
+
+    def clean_target_at(self):
+        value = self.cleaned_data['target_at']
+        if timezone.is_naive(value):
+            value = timezone.make_aware(value, timezone.get_current_timezone())
+        return value
+
+
+class NotificationBlastForm(forms.ModelForm):
+    destination = forms.CharField(required=False, max_length=500, label='Destination path')
+
+    class Meta:
+        model = NotificationBlast
+        fields = ['title', 'body', 'destination', 'audience', 'scheduled_for']
+        widgets = {
+            'body': forms.Textarea(attrs={'rows': 5}),
+            'scheduled_for': forms.DateTimeInput(attrs={'type': 'datetime-local'}),
+        }
+
+    def clean_destination(self):
+        value = (self.cleaned_data.get('destination') or '').strip() or '/home/'
+        from urllib.parse import urlsplit
+        parsed = urlsplit(value)
+        if not value.startswith('/') or value.startswith('//') or '\\' in value or parsed.scheme or parsed.netloc:
+            raise forms.ValidationError('Use an internal QueueUp path beginning with /.')
+        return value
+
+    def clean_scheduled_for(self):
+        value = self.cleaned_data.get('scheduled_for')
+        if value and timezone.is_naive(value):
+            value = timezone.make_aware(value, timezone.get_current_timezone())
+        if value and value <= timezone.now():
+            raise forms.ValidationError('Scheduled time must be in the future.')
+        return value

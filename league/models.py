@@ -49,6 +49,49 @@ class SeasonRecapView(models.Model):
         constraints = [models.UniqueConstraint(fields=['user', 'season'], name='one_recap_view_per_user_season')]
 
 
+class HomepageCountdown(models.Model):
+    title = models.CharField(max_length=160)
+    target_at = models.DateTimeField()
+    active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='created_countdowns')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at', '-pk']
+
+    def __str__(self):
+        return self.title
+
+
+class NotificationBlast(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        SCHEDULED = 'scheduled', 'Scheduled'
+        SENDING = 'sending', 'Sending'
+        SENT = 'sent', 'Sent'
+        CANCELLED = 'cancelled', 'Cancelled'
+
+    class Audience(models.TextChoices):
+        APPROVED = 'approved', 'All approved players'
+
+    title = models.CharField(max_length=120)
+    body = models.TextField(max_length=1000)
+    destination = models.CharField(max_length=500, default='/home/')
+    audience = models.CharField(max_length=24, choices=Audience.choices, default=Audience.APPROVED)
+    scheduled_for = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='created_notification_blasts')
+    created_at = models.DateTimeField(auto_now_add=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at', '-pk']
+
+    def __str__(self):
+        return self.title
+
+
 class Badge(models.Model):
     name = models.CharField(max_length=80)
     slug = models.SlugField(max_length=80, unique=True)

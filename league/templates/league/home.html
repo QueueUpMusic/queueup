@@ -1,4 +1,5 @@
 {% extends 'league/base.html' %}{% block content %}
+{% if countdown %}<section class="homepage-countdown" data-countdown data-target="{{ countdown.target_at|date:'c' }}"><span class="pill">{{ countdown.title }}</span><div class="countdown-values" aria-live="polite"><span><b data-countdown-days>00</b><small>days</small></span><i>:</i><span><b data-countdown-hours>00</b><small>hours</small></span><i>:</i><span><b data-countdown-minutes>00</b><small>min</small></span><i>:</i><span><b data-countdown-seconds>00</b><small>sec</small></span></div><strong class="countdown-expired" data-countdown-expired hidden>It’s time!</strong></section>{% endif %}
 {% if recap_season %}<a class="recap-entry" href="{% url 'season_recap' recap_season.pk %}"><span>✦</span><div><strong>Your {{ recap_season.name }} recap is ready</strong><small>A colorful look back at your season</small></div><b>View recap →</b></a>{% endif %}
 {% if current_first %}
   {% if round %}{% include 'league/partials/home_round_card.html' with card_round=round submission=submission is_results_card=False only %}{% endif %}

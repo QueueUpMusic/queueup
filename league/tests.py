@@ -23,7 +23,7 @@ from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from django.utils import timezone
 
-from .models import AchievementUnlock, Badge, NotificationDelivery, PushSubscription, Round, Season, SeasonRecapView, SeasonWelcome, Submission, UserBadge, Vote
+from .models import AchievementUnlock, Badge, HomepageCountdown, NotificationBlast, NotificationDelivery, PushSubscription, Round, Season, SeasonRecapView, SeasonWelcome, Submission, UserBadge, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
 from .services.ballots import ballot_for_user
 from .services.profiles import profile_for_user, profile_metrics as service_profile_metrics
@@ -38,6 +38,9 @@ from .services.recaps import RecapUnavailable, recap_is_available, season_recap_
 from .services.notifications import recap_notification_events
 from .services import votes as vote_service
 from .voting import voting_progress
+from .forms import NotificationBlastForm
+from .services.countdowns import active_homepage_countdown
+from .services.notification_blasts import event_key_for_blast, send_due_blasts
 
 
 class QueueUpTestMixin:
@@ -4159,3 +4162,84 @@ class SeasonRecapTests(QueueUpTestMixin, TestCase):
         self.assertContains(older, other_round.prompt)
         self.assertNotContains(older, self.round.prompt)
         self.assertNotContains(older, 'View your Older Season Recap')
+
+
+class HomepageCountdownTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user('countdown-staff', password='x', is_staff=True)
+
+    def test_staff_can_create_and_edit_countdown_and_it_appears_home(self):
+        self.client.force_login(self.staff)
+        target = timezone.now() + timedelta(days=3)
+        response = self.client.post(reverse('countdown_create'), {'title': 'Season finale', 'target_at': target.strftime('%Y-%m-%dT%H:%M'), 'active': 'on'})
+        countdown = HomepageCountdown.objects.get()
+        self.assertRedirects(response, reverse('control_countdowns'))
+        self.assertEqual(self.client.get(reverse('home')).context['countdown'], countdown)
+        response = self.client.post(reverse('countdown_edit', args=[countdown.pk]), {'title': 'Updated finale', 'target_at': target.strftime('%Y-%m-%dT%H:%M'), 'active': ''})
+        self.assertRedirects(response, reverse('control_countdowns'))
+        self.assertFalse(HomepageCountdown.objects.get().active)
+        self.client.post(reverse('countdown_action', args=[countdown.pk, 'delete']))
+        self.assertFalse(HomepageCountdown.objects.exists())
+
+    def test_non_staff_cannot_manage_and_newest_active_is_selected(self):
+        self.client.force_login(self.alice)
+        self.assertEqual(self.client.get(reverse('control_countdowns')).status_code, 302)
+        first = HomepageCountdown.objects.create(title='Old', target_at=timezone.now() + timedelta(days=1), active=True)
+        second = HomepageCountdown.objects.create(title='New', target_at=timezone.now() + timedelta(days=2), active=True)
+        second.updated_at = first.updated_at + timedelta(seconds=1)
+        second.save(update_fields=['updated_at'])
+        self.assertEqual(active_homepage_countdown(), second)
+
+    def test_target_is_timezone_aware_and_expired_home_countdown_has_no_negative_display(self):
+        target = timezone.now() - timedelta(seconds=1)
+        HomepageCountdown.objects.create(title='Now', target_at=target, active=True)
+        self.assertTrue(HomepageCountdown.objects.get().target_at.tzinfo is not None)
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('home'))
+        self.assertIn(target.astimezone(timezone.get_current_timezone()).isoformat()[:19], response.content.decode())
+
+
+class NotificationBlastTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user('blast-staff', password='x', is_staff=True)
+        for user in (self.alice, self.bob):
+            PushSubscription.objects.create(user=user, endpoint=f'https://push/{user.username}', p256dh='p', auth='a')
+        self.pending = User.objects.create_user('blast-pending', password='x')
+        PushSubscription.objects.create(user=self.pending, endpoint='https://push/pending', p256dh='p', auth='a')
+
+    def test_staff_only_and_destination_validation(self):
+        self.client.force_login(self.alice)
+        self.assertEqual(self.client.get(reverse('control_notifications')).status_code, 302)
+        self.assertFalse(NotificationBlastForm(data={'title': 'Hi', 'body': 'Body', 'destination': 'javascript:alert(1)', 'audience': 'approved'}).is_valid())
+
+    @patch('league.services.notification_blasts.send_push')
+    def test_send_now_confirms_then_sends_approved_subscriptions_once(self, send_push):
+        send_push.return_value = {'sent': 2, 'skipped': 0, 'removed': 0, 'failed': 0}
+        self.client.force_login(self.staff)
+        response = self.client.post(reverse('notification_create'), {'title': 'New round', 'body': 'Submit!', 'destination': '', 'audience': 'approved', 'action': 'send_now'})
+        blast = NotificationBlast.objects.get()
+        self.assertRedirects(response, reverse('notification_confirm', args=[blast.pk]))
+        self.client.post(reverse('notification_confirm', args=[blast.pk]))
+        blast.refresh_from_db()
+        self.assertEqual(blast.status, NotificationBlast.Status.SENT)
+        self.assertEqual(event_key_for_blast(blast), f'admin-blast:{blast.pk}')
+        send_push.assert_called_once()
+        self.assertEqual(send_push.call_args.args[0].count(), 2)
+
+    @patch('league.services.notification_blasts.send_push')
+    def test_scheduled_blast_waits_then_sends_once_and_cancelled_does_not(self, send_push):
+        send_push.return_value = {'sent': 2, 'skipped': 0, 'removed': 0, 'failed': 0}
+        blast = NotificationBlast.objects.create(title='Later', body='Soon', scheduled_for=timezone.now() + timedelta(hours=1), status='scheduled', created_by=self.staff)
+        self.assertEqual(send_due_blasts()['sent'], 0)
+        send_push.assert_not_called()
+        blast.scheduled_for = timezone.now() - timedelta(seconds=1)
+        blast.save(update_fields=['scheduled_for'])
+        self.assertEqual(send_due_blasts()['sent'], 2)
+        self.assertEqual(send_due_blasts()['sent'], 0)
+        blast.refresh_from_db()
+        self.assertEqual(blast.status, NotificationBlast.Status.SENT)
+        cancelled = NotificationBlast.objects.create(title='Nope', body='Nope', scheduled_for=timezone.now() - timedelta(seconds=1), status='cancelled')
+        self.assertEqual(send_due_blasts()['sent'], 0)
+        self.assertEqual(cancelled.status, 'cancelled')
