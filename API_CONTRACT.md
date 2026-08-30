@@ -108,6 +108,50 @@ Additional error fields may be included (e.g., `errors` for form validation).
 | GET | `/api/v1/` | Required | API index/health |
 | GET | `/api/v1/session/` | Required (pending ok) | Current session info |
 
+### Native Authentication
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/api/v1/auth/csrf/` | Anonymous | Issue a CSRF token and cookie |
+| POST | `/api/v1/auth/login/` | Anonymous | Authenticate with a username and password |
+| POST | `/api/v1/auth/signup/` | Anonymous | Create an account and establish a session |
+| POST | `/api/v1/auth/logout/` | Authenticated (pending ok) | End the current session |
+
+Authentication uses Django sessions; these endpoints do not issue JWTs or API
+tokens. All POST requests require the CSRF token from the `csrftoken` cookie
+(the configured cookie name may differ) in the `X-CSRFToken` header.
+
+`/api/v1/auth/login/` accepts `{ "username": "...", "password": "..." }`.
+Successful login returns the same session data shape documented below.
+
+`/api/v1/auth/signup/` accepts:
+
+```json
+{
+  "display_name": "Alice",
+  "username": "alice",
+  "email": "alice@example.com",
+  "password": "...",
+  "password_confirm": "...",
+  "agree_to_terms": true
+}
+```
+
+Terms must be explicitly accepted with the JSON boolean `true`. Successful
+signup logs the user in, but the new user's `approved` value remains `false`
+until staff approval. Login and signup validation failures use the standard
+error envelope with an additional `errors` object containing Django form
+field errors.
+
+Successful logout returns:
+
+```json
+{
+  "ok": true,
+  "data": {"authenticated": false, "user": null}
+}
+```
+
 **`/api/v1/session/` Response:**
 ```json
 {

@@ -11,6 +11,19 @@ def user_summary(user):
     }
 
 
+def session_user(user):
+    approved = user.is_staff or user.is_superuser or user.profile.approved
+    return {
+        'id': user.pk,
+        'username': user.username,
+        'display_name': user.first_name or user.username,
+        'email': user.email,
+        'approved': approved,
+        'is_staff': user.is_staff,
+        'is_superuser': user.is_superuser,
+    }
+
+
 def season_summary(season):
     return {
         'id': season.pk,

@@ -192,6 +192,203 @@ class ApiFoundationTests(QueueUpTestMixin, TestCase):
         )
 
 
+class ApiNativeAuthTests(QueueUpTestMixin, TestCase):
+    def csrf_client(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        response = client.get(reverse('api-v1:auth-csrf'))
+        self.assertEqual(response.status_code, 200)
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+        return client, token
+
+    def post_json(self, client, url_name, data, token=None):
+        headers = {'HTTP_X_CSRFTOKEN': token} if token else {}
+        return client.post(
+            reverse(url_name), data=json.dumps(data),
+            content_type='application/json', **headers,
+        )
+
+    def test_csrf_endpoint_is_anonymous_and_sets_cookie(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        response = client.get(reverse('api-v1:auth-csrf'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['data']['csrf_token'])
+        self.assertIn(settings.CSRF_COOKIE_NAME, client.cookies)
+
+    def test_login_accepts_approved_user_and_returns_session_state(self):
+        client, token = self.csrf_client()
+
+        response = self.post_json(client, 'api-v1:auth-login', {
+            'username': 'alice', 'password': 'x',
+        }, token)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['user']['id'], self.alice.pk)
+        self.assertTrue(response.json()['data']['user']['approved'])
+        self.assertTrue(client.get(reverse('api-v1:session')).json()['data']['authenticated'])
+
+    def test_login_accepts_pending_user_without_approval(self):
+        pending = User.objects.create_user('pending-login', password='x')
+        client, token = self.csrf_client()
+
+        response = self.post_json(client, 'api-v1:auth-login', {
+            'username': pending.username, 'password': 'x',
+        }, token)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['data']['user']['approved'])
+        self.assertEqual(
+            client.get(reverse('api-v1:session')).status_code, 200,
+        )
+        self.assertEqual(
+            client.get(reverse('api-v1:onboarding')).status_code, 200,
+        )
+
+    def test_login_rejects_bad_password_inactive_user_and_missing_fields(self):
+        client, token = self.csrf_client()
+        bad_password = self.post_json(client, 'api-v1:auth-login', {
+            'username': 'alice', 'password': 'wrong',
+        }, token)
+        missing = self.post_json(client, 'api-v1:auth-login', {}, token)
+
+        inactive = User.objects.create_user('inactive-login', password='x', is_active=False)
+        inactive.profile.approved = True
+        inactive.profile.save(update_fields=['approved'])
+        inactive_response = self.post_json(client, 'api-v1:auth-login', {
+            'username': inactive.username, 'password': 'x',
+        }, token)
+
+        for response in (bad_password, inactive_response, missing):
+            self.assertEqual(response.status_code, 400)
+            self.assertFalse(response.json()['ok'])
+            self.assertIn('errors', response.json()['error'])
+
+    def test_login_requires_csrf(self):
+        from django.test import Client
+
+        response = self.post_json(
+            Client(enforce_csrf_checks=True), 'api-v1:auth-login',
+            {'username': 'alice', 'password': 'x'},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error']['code'], 'csrf_failed')
+
+    def test_signup_logs_user_in_but_leaves_user_pending(self):
+        client, token = self.csrf_client()
+        response = self.post_json(client, 'api-v1:auth-signup', {
+            'display_name': 'New Player', 'username': 'new-api-player',
+            'email': 'new-api@example.com', 'password': 'a-secure-password-123',
+            'password_confirm': 'a-secure-password-123', 'agree_to_terms': True,
+        }, token)
+
+        self.assertEqual(response.status_code, 200)
+        user = User.objects.get(username='new-api-player')
+        self.assertFalse(user.profile.approved)
+        self.assertEqual(response.json()['data']['user']['id'], user.pk)
+        self.assertFalse(response.json()['data']['user']['approved'])
+        self.assertEqual(client.get(reverse('api-v1:session')).status_code, 200)
+
+    def test_signup_requires_boolean_terms_and_preserves_form_errors(self):
+        client, token = self.csrf_client()
+        response = self.post_json(client, 'api-v1:auth-signup', {
+            'display_name': 'New Player', 'username': 'terms-api-player',
+            'email': 'terms-api@example.com', 'password': 'a-secure-password-123',
+            'password_confirm': 'a-secure-password-123', 'agree_to_terms': 'true',
+        }, token)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('agree_to_terms', response.json()['error']['errors'])
+
+    def test_signup_rejects_password_mismatch_and_duplicate_username(self):
+        client, token = self.csrf_client()
+        common = {
+            'display_name': 'New Player', 'email': 'signup-api@example.com',
+            'password': 'a-secure-password-123', 'agree_to_terms': True,
+        }
+        mismatch = self.post_json(client, 'api-v1:auth-signup', {
+            **common, 'username': 'mismatch-api', 'password_confirm': 'different',
+        }, token)
+        duplicate = self.post_json(client, 'api-v1:auth-signup', {
+            **common, 'username': 'alice', 'password_confirm': common['password'],
+        }, token)
+
+        self.assertEqual(mismatch.status_code, 400)
+        self.assertIn('password2', mismatch.json()['error']['errors'])
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertIn('username', duplicate.json()['error']['errors'])
+
+    def test_signup_requires_csrf(self):
+        from django.test import Client
+
+        response = self.post_json(
+            Client(enforce_csrf_checks=True), 'api-v1:auth-signup', {},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error']['code'], 'csrf_failed')
+
+    def test_logout_allows_approved_and_pending_users(self):
+        client, token = self.csrf_client()
+        self.post_json(client, 'api-v1:auth-login', {
+            'username': 'alice', 'password': 'x',
+        }, token)
+        client.get(reverse('api-v1:auth-csrf'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+        response = self.post_json(client, 'api-v1:auth-logout', {}, token)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['data']['authenticated'])
+        self.assertEqual(client.get(reverse('api-v1:session')).status_code, 401)
+
+        pending = User.objects.create_user('pending-logout', password='x')
+        client, token = self.csrf_client()
+        self.post_json(client, 'api-v1:auth-login', {
+            'username': pending.username, 'password': 'x',
+        }, token)
+        client.get(reverse('api-v1:auth-csrf'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+        response = self.post_json(client, 'api-v1:auth-logout', {}, token)
+        self.assertEqual(response.status_code, 200)
+
+    def test_logout_requires_active_authentication_and_csrf(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.get(reverse('api-v1:auth-csrf'))
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
+        anonymous = self.post_json(client, 'api-v1:auth-logout', {}, token)
+        self.assertEqual(anonymous.status_code, 401)
+        self.assertEqual(anonymous.json()['error']['code'], 'authentication_required')
+
+        client, token = self.csrf_client()
+        self.post_json(client, 'api-v1:auth-login', {
+            'username': 'alice', 'password': 'x',
+        }, token)
+        missing_csrf = self.post_json(client, 'api-v1:auth-logout', {})
+        self.assertEqual(missing_csrf.status_code, 403)
+        self.assertEqual(missing_csrf.json()['error']['code'], 'csrf_failed')
+
+    def test_session_shape_for_pending_and_anonymous_users(self):
+        pending = User.objects.create_user('pending-session', password='x')
+        self.client.force_login(pending)
+        response = self.client.get(reverse('api-v1:session'))
+        user = response.json()['data']['user']
+
+        self.assertEqual(set(user), {
+            'id', 'username', 'display_name', 'email', 'approved',
+            'is_staff', 'is_superuser',
+        })
+        self.assertFalse(user['approved'])
+        self.client.logout()
+        self.assertEqual(
+            self.client.get(reverse('api-v1:session')).status_code, 401,
+        )
+
+
 class PlayerReadApiTests(QueueUpTestMixin, TestCase):
     def setUp(self):
         super().setUp()

@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import account_views, player_views, staff_views, submission_views, views, voting_views
+from . import auth_views, account_views, player_views, staff_views, submission_views, views, voting_views
 
 
 app_name = 'api-v1'
@@ -8,6 +8,10 @@ app_name = 'api-v1'
 urlpatterns = [
     path('', views.api_index, name='index'),
     path('session/', views.current_session, name='session'),
+    path('auth/csrf/', auth_views.csrf_token, name='auth-csrf'),
+    path('auth/login/', auth_views.login_user, name='auth-login'),
+    path('auth/signup/', auth_views.signup, name='auth-signup'),
+    path('auth/logout/', auth_views.logout_user, name='auth-logout'),
     path('profile/', account_views.update_profile, name='profile-update'),
     path('profile/picture/', account_views.profile_picture, name='profile-picture'),
     path('onboarding/', account_views.onboarding_state, name='onboarding'),
