@@ -545,9 +545,10 @@ def notification_create(request):
 @staff_required
 def notification_edit(request, pk):
     blast = get_object_or_404(NotificationBlast, pk=pk)
-    if blast.status != NotificationBlast.Status.SCHEDULED:
-        messages.error(request, 'Only scheduled notifications can be edited.')
+    if blast.status not in (NotificationBlast.Status.DRAFT, NotificationBlast.Status.SCHEDULED):
+        messages.error(request, 'Only draft or scheduled notifications can be edited.')
         return redirect('control_notifications')
+    heading = 'Edit notification' if blast.status == NotificationBlast.Status.DRAFT else 'Edit scheduled notification'
     form = NotificationBlastForm(request.POST or None, instance=blast)
     if request.method == 'POST' and form.is_valid():
         updated = form.save(commit=False)
@@ -558,13 +559,13 @@ def notification_edit(request, pk):
             updated.status = NotificationBlast.Status.SCHEDULED
         else:
             form.add_error('scheduled_for', 'Choose a future date and time, or use Send now.')
-            return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Edit scheduled notification', 'back_url': reverse('control_notifications'), 'notification_form': True})
+            return render(request, 'league/admin_form.html', {'form': form, 'heading': heading, 'back_url': reverse('control_notifications'), 'notification_form': True})
         updated.save()
         if updated.status == NotificationBlast.Status.DRAFT:
             return redirect('notification_confirm', pk=updated.pk)
         messages.success(request, 'Scheduled notification updated.')
         return redirect('control_notifications')
-    return render(request, 'league/admin_form.html', {'form': form, 'heading': 'Edit scheduled notification', 'back_url': reverse('control_notifications'), 'notification_form': True})
+    return render(request, 'league/admin_form.html', {'form': form, 'heading': heading, 'back_url': reverse('control_notifications'), 'notification_form': True})
 
 
 @staff_required

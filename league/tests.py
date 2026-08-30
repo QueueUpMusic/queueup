@@ -4228,6 +4228,22 @@ class NotificationBlastTests(QueueUpTestMixin, TestCase):
         send_push.assert_called_once()
         self.assertEqual(send_push.call_args.args[0].count(), 2)
 
+    def test_send_now_draft_can_return_to_editing(self):
+        self.client.force_login(self.staff)
+        blast = NotificationBlast.objects.create(
+            title='Typo', body='Fix me', status=NotificationBlast.Status.DRAFT, created_by=self.staff,
+        )
+        response = self.client.get(reverse('notification_edit', args=[blast.pk]))
+        self.assertEqual(response.status_code, 200)
+        response = self.client.post(reverse('notification_edit', args=[blast.pk]), {
+            'title': 'Corrected', 'body': 'Fixed', 'destination': '/home/',
+            'audience': 'approved', 'action': 'send_now',
+        })
+        self.assertRedirects(response, reverse('notification_confirm', args=[blast.pk]))
+        blast.refresh_from_db()
+        self.assertEqual(blast.title, 'Corrected')
+        self.assertEqual(blast.status, NotificationBlast.Status.DRAFT)
+
     @patch('league.services.notification_blasts.send_push')
     def test_scheduled_blast_waits_then_sends_once_and_cancelled_does_not(self, send_push):
         send_push.return_value = {'sent': 2, 'skipped': 0, 'removed': 0, 'failed': 0}
@@ -4243,3 +4259,20 @@ class NotificationBlastTests(QueueUpTestMixin, TestCase):
         cancelled = NotificationBlast.objects.create(title='Nope', body='Nope', scheduled_for=timezone.now() - timedelta(seconds=1), status='cancelled')
         self.assertEqual(send_due_blasts()['sent'], 0)
         self.assertEqual(cancelled.status, 'cancelled')
+
+    @patch('league.services.notification_blasts.send_push')
+    def test_due_sender_recovers_only_stale_sending_blasts(self, send_push):
+        send_push.return_value = {'sent': 2, 'skipped': 0, 'removed': 0, 'failed': 0}
+        stale = NotificationBlast.objects.create(
+            title='Stale', body='Retry after crash', scheduled_for=timezone.now() - timedelta(hours=1),
+            status=NotificationBlast.Status.SENDING,
+            sending_started_at=timezone.now() - timedelta(minutes=16),
+        )
+        NotificationBlast.objects.create(
+            title='Active', body='Still sending', scheduled_for=timezone.now() - timedelta(hours=1),
+            status=NotificationBlast.Status.SENDING, sending_started_at=timezone.now(),
+        )
+        self.assertEqual(send_due_blasts()['sent'], 2)
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, NotificationBlast.Status.SENT)
+        self.assertEqual(send_push.call_count, 1)
