@@ -471,6 +471,7 @@ Before making a change:
    - Django tests
    - JavaScript syntax checks where relevant
 9. Keep Docker deployment compatibility.
+10. If Django is unavailable in the local host environment, do not stop or report that testing cannot run; instead use `docker compose exec web ...` (or the repo's equivalent service) for Django checks, migrations, and tests.
 
 ---
 
