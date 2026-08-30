@@ -9,6 +9,7 @@ from league.services.notifications import (
     recap_notification_events,
     round_notification_events,
 )
+from league.services.notification_blasts import send_due_blasts
 
 
 class Command(BaseCommand):
@@ -57,6 +58,8 @@ class Command(BaseCommand):
 
         for event in recap_notification_events(now):
             merge(self.send(event.subscriptions, event.event_key, event.title, event.body, event.url))
+
+        merge(send_due_blasts(self.stderr))
 
         self.stdout.write(self.style.SUCCESS(
             'QueueUp notification check complete: '
