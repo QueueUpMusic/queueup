@@ -420,6 +420,60 @@ class PlayerReadApiTests(QueueUpTestMixin, TestCase):
             [('results', previous.pk), ('current', self.round.pk)],
         )
 
+    def test_dashboard_round_summary_matches_web_counts_and_host_metadata(self):
+        self.bob.first_name = 'Jerry'
+        self.bob.save(update_fields=['first_name'])
+        self.bob.profile.picture = SimpleUploadedFile(
+            'host.png', ProfileUploadCsrfTests.png_bytes(),
+            content_type='image/png',
+        )
+        self.bob.profile.save(update_fields=['picture'])
+        self.round.host = self.bob
+        self.round.save(update_fields=['host'])
+
+        songs = [
+            self.submission(self.alice, 'dashboard-a'),
+            self.submission(self.bob, 'dashboard-b'),
+            self.submission(self.cara, 'dashboard-c'),
+        ]
+        for voter, submission in zip(
+            (self.alice, self.bob, self.cara, self.alice),
+            (songs[1], songs[0], songs[0], songs[2]),
+        ):
+            Vote.objects.create(
+                round=self.round, voter=voter, submission=submission, score=4,
+            )
+
+        web = self.client.get(reverse('home'))
+        api = self.client.get(reverse('api-v1:dashboard')).json()['data']
+        current = api['current_round']
+
+        self.assertEqual(current['submission_count'], web.context['round'].submissions.count())
+        self.assertEqual(current['rating_count'], web.context['round'].votes.count())
+        self.assertEqual(current['submission_count'], 3)
+        self.assertEqual(current['rating_count'], 4)
+        self.assertEqual(current['host']['display_name'], 'Jerry')
+        self.assertTrue(current['host']['picture_url'].startswith('/media/'))
+        self.assertEqual(set(current['host']), {'display_name', 'picture_url'})
+        self.assertNotIn('dashboard-a', current)
+        self.assertNotIn('submitter', current)
+
+        self.bob.profile.picture.delete(save=False)
+
+    def test_dashboard_round_summary_uses_null_host_picture_when_unset(self):
+        self.round.host = self.bob
+        self.round.save(update_fields=['host'])
+
+        current = self.client.get(reverse('api-v1:dashboard')).json()['data']['current_round']
+
+        self.assertEqual(current['host']['display_name'], 'bob')
+        self.assertIsNone(current['host']['picture_url'])
+
+    def test_dashboard_round_summary_uses_null_host_when_unassigned(self):
+        current = self.client.get(reverse('api-v1:dashboard')).json()['data']['current_round']
+
+        self.assertIsNone(current['host'])
+
     def test_hidden_and_draft_rounds_are_not_available_to_players(self):
         self.round.goes_live_at = timezone.now() + timedelta(days=1)
         self.round.save(update_fields=['goes_live_at'])

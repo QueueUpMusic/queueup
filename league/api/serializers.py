@@ -11,6 +11,15 @@ def user_summary(user):
     }
 
 
+def host_summary(user):
+    if not user:
+        return None
+    return {
+        'display_name': user.first_name or user.username,
+        'picture_url': user.profile.picture.url if user.profile.picture else None,
+    }
+
+
 def session_user(user):
     approved = user.is_staff or user.is_superuser or user.profile.approved
     return {
@@ -37,6 +46,12 @@ def season_summary(season):
 
 
 def round_summary(round_obj):
+    submission_count = getattr(round_obj, 'submission_count', None)
+    if submission_count is None:
+        submission_count = round_obj.submissions.count()
+    rating_count = getattr(round_obj, 'rating_count', None)
+    if rating_count is None:
+        rating_count = round_obj.votes.count()
     data = {
         'id': round_obj.pk,
         'season': season_summary(round_obj.season),
@@ -48,7 +63,9 @@ def round_summary(round_obj):
         'voting_deadline': iso(round_obj.voting_deadline),
         'reveal_at': iso(round_obj.reveal_at),
         'archived': round_obj.archived,
-        'submission_count': round_obj.submissions.count(),
+        'submission_count': submission_count,
+        'rating_count': rating_count,
+        'host': host_summary(round_obj.host),
     }
     if round_obj.state == 'revealed':
         data['playlist_url'] = round_obj.playlist_url or None

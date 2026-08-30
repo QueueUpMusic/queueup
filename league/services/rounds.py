@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from django.db import models
+from django.db.models import Count
 from django.utils import timezone
 
 from ..models import Round
@@ -121,7 +122,12 @@ def player_visible_rounds(now=None):
 def homepage_rounds(now=None):
     """Return the current and latest-results rounds shown on the homepage."""
     now = now or timezone.now()
-    visible = player_visible_rounds(now=now).filter(archived=False)
+    visible = player_visible_rounds(now=now).filter(archived=False).select_related(
+        'season', 'host', 'host__profile',
+    ).annotate(
+        submission_count=Count('submissions', distinct=True),
+        rating_count=Count('votes', distinct=True),
+    )
 
     current = visible.filter(
         submission_opens__lte=now,

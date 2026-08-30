@@ -171,6 +171,23 @@ Successful logout returns:
 }
 ```
 
+Round summaries include these dashboard card fields:
+
+```json
+{
+  "submission_count": 3,
+  "rating_count": 6,
+  "host": {
+    "display_name": "Jerry",
+    "picture_url": "/media/profile_pictures/2026/08/avatar.jpg"
+  }
+}
+```
+
+`rating_count` is the total number of Vote records for the round, matching the
+web Home card's Ratings metric. `host` is `null` when no host is assigned;
+`host.picture_url` is nullable when the host has no profile picture.
+
 ---
 
 ### Player Read Endpoints
