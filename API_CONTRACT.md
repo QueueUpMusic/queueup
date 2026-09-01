@@ -282,10 +282,58 @@ All require `@api_user_required` (authenticated + approved).
 | POST | `/api/v1/onboarding/season-welcome/` | Required | Acknowledge season welcome |
 | POST | `/api/v1/onboarding/voting-guide/` | Required | Acknowledge voting guide |
 | POST | `/api/v1/onboarding/submission-rules/` | Required | Accept submission rules |
-| POST | `/api/v1/profile/` | Required | Update profile display name |
+| POST | `/api/v1/profile/` | Required | Update the authenticated user's display name and/or email |
 | POST,DELETE | `/api/v1/profile/picture/` | Required | Set/remove profile picture |
 | GET | `/api/v1/notifications/` | Required | Get notification preferences |
 | POST,DELETE | `/api/v1/push/subscriptions/` | Required | Manage push subscriptions |
+
+**`/api/v1/profile/` Request:**
+
+The request body is a JSON object. Both fields are optional, so a partial update
+may change either field independently:
+
+```json
+{
+  "display_name": "Alice Updated",
+  "email": "alice.updated@example.com"
+}
+```
+
+`display_name` is trimmed and must be non-empty when supplied. `email` is
+trimmed and validated with Django's email field validation. Omitting a field
+preserves its current value. `username` is read-only and is ignored if sent.
+There is no application-level email uniqueness rule; changing an email does not
+check it against other users.
+
+Successful updates return the authoritative current profile data:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "display_name": "Alice Updated",
+    "email": "alice.updated@example.com",
+    "picture_url": "/media/profile_pictures/2026/08/avatar.jpg"
+  }
+}
+```
+
+Invalid JSON returns `400` with `error.code` `invalid_json`. Validation errors
+return `400` with `error.code` `invalid_profile`, the first human-readable
+message in `error.message`, and field errors in `error.errors`, for example:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "invalid_profile",
+    "message": "Enter a valid email address.",
+    "errors": {
+      "email": [{"message": "Enter a valid email address.", "code": "invalid"}]
+    }
+  }
+}
+```
 
 ---
 

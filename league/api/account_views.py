@@ -3,7 +3,7 @@ from urllib.parse import unquote
 
 from django.conf import settings
 
-from ..forms import ProfileForm, ProfilePictureForm
+from ..forms import ProfileApiForm, ProfileForm, ProfilePictureForm
 from ..services import media as media_service
 from ..services import membership as membership_service
 from ..services import notifications as notification_service
@@ -29,13 +29,17 @@ def update_profile(request):
     body = _json_body(request)
     if body is None:
         return error('invalid_json', 'A JSON object is required.', 400)
-    form = ProfileForm(body, user=request.user)
+    form = ProfileApiForm(body, user=request.user)
     if not form.is_valid():
         message = next(iter(form.errors.values()))[0]
-        return error('invalid_profile', str(message), 400)
+        return error(
+            'invalid_profile', str(message), 400,
+            errors=form.errors.get_json_data(),
+        )
     form.save()
     return success({
         'display_name': request.user.first_name or request.user.username,
+        'email': request.user.email,
         'picture_url': _picture_url(request.user),
     })
 

@@ -958,6 +958,81 @@ class AccountApiTests(QueueUpTestMixin, TestCase):
         self.alice.refresh_from_db()
         self.assertEqual(self.alice.first_name, 'API Alice')
 
+    def profile_update(self, payload):
+        return self.client.post(
+            reverse('api-v1:profile-update'),
+            data=json.dumps(payload),
+            content_type='application/json',
+        )
+
+    def test_profile_update_email_only_preserves_display_name(self):
+        self.alice.first_name = 'Original Name'
+        self.alice.email = 'original@example.com'
+        self.alice.save(update_fields=['first_name', 'email'])
+
+        response = self.profile_update({'email': '  updated@example.com  '})
+
+        self.assertEqual(response.status_code, 200)
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.email, 'updated@example.com')
+        self.assertEqual(self.alice.first_name, 'Original Name')
+        self.assertEqual(response.json()['data']['email'], 'updated@example.com')
+
+    def test_profile_update_display_name_only_preserves_email(self):
+        self.alice.email = 'original@example.com'
+        self.alice.save(update_fields=['email'])
+
+        response = self.profile_update({'display_name': 'Updated Name'})
+
+        self.assertEqual(response.status_code, 200)
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.first_name, 'Updated Name')
+        self.assertEqual(self.alice.email, 'original@example.com')
+
+    def test_profile_update_can_update_display_name_and_email_together(self):
+        response = self.profile_update({
+            'display_name': 'Updated Name',
+            'email': 'updated@example.com',
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.first_name, 'Updated Name')
+        self.assertEqual(self.alice.email, 'updated@example.com')
+        self.assertEqual(response.json()['data']['display_name'], 'Updated Name')
+        self.assertEqual(response.json()['data']['email'], 'updated@example.com')
+
+    def test_profile_update_rejects_invalid_email_without_saving(self):
+        self.alice.email = 'original@example.com'
+        self.alice.save(update_fields=['email'])
+
+        response = self.profile_update({'email': 'not-an-email'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['error']['code'], 'invalid_profile')
+        self.assertIn('email', response.json()['error']['errors'])
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.email, 'original@example.com')
+
+    def test_profile_update_ignores_username_and_keeps_it_read_only(self):
+        response = self.profile_update({
+            'username': 'different-username',
+            'display_name': 'Updated Name',
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.alice.refresh_from_db()
+        self.assertEqual(self.alice.username, 'alice')
+        self.assertNotIn('username', response.json()['data'])
+
+    def test_anonymous_profile_update_is_rejected(self):
+        self.client.logout()
+
+        response = self.profile_update({'email': 'anonymous@example.com'})
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()['error']['code'], 'authentication_required')
+
     def test_current_season_acknowledgement_is_idempotent_and_hides_html_prompt(self):
         url = reverse('api-v1:season-welcome')
 

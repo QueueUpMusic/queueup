@@ -19,7 +19,7 @@ class SignupForm(UserCreationForm):
     def save(self, commit=True):
         user = super().save(commit=False)
         user.first_name = self.cleaned_data['display_name'].strip()
-        user.email = self.cleaned_data['email'].strip()
+        user.email = normalize_email(self.cleaned_data['email'])
         if commit:
             user.save()
         return user
@@ -82,6 +82,42 @@ class ProfileForm(forms.Form):
     def save(self):
         self.user.first_name = self.cleaned_data['display_name'].strip()
         self.user.save(update_fields=['first_name'])
+        profile, _ = UserProfile.objects.get_or_create(user=self.user)
+        return profile
+
+
+def normalize_email(value):
+    """Apply QueueUp's existing email normalization rule."""
+    return (value or '').strip()
+
+
+class ProfileApiForm(forms.Form):
+    display_name = forms.CharField(required=False, max_length=150, label='Display name')
+    email = forms.EmailField(required=False, label='Email')
+
+    def __init__(self, *args, user=None, **kwargs):
+        self.user = user
+        super().__init__(*args, **kwargs)
+
+    def clean_display_name(self):
+        value = self.cleaned_data.get('display_name', '')
+        if 'display_name' in self.data and not value.strip():
+            raise forms.ValidationError('Display name cannot be empty.')
+        return value.strip()
+
+    def clean_email(self):
+        return normalize_email(self.cleaned_data.get('email'))
+
+    def save(self):
+        changed_fields = []
+        if 'display_name' in self.data:
+            self.user.first_name = self.cleaned_data['display_name']
+            changed_fields.append('first_name')
+        if 'email' in self.data:
+            self.user.email = self.cleaned_data['email']
+            changed_fields.append('email')
+        if changed_fields:
+            self.user.save(update_fields=changed_fields)
         profile, _ = UserProfile.objects.get_or_create(user=self.user)
         return profile
 
