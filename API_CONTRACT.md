@@ -199,12 +199,69 @@ All require `@api_user_required` (authenticated + approved).
 | GET | `/api/v1/dashboard/` | Current round + recent results |
 | GET | `/api/v1/seasons/` | List of seasons |
 | GET | `/api/v1/archive/` | Archived rounds |
+| GET | `/api/v1/seasons/<id>/recap/` | Authenticated player's season recap |
 | GET | `/api/v1/rounds/<pk>/` | Round detail |
 | GET | `/api/v1/rounds/<pk>/ballot/` | Voting ballot |
 | GET | `/api/v1/rounds/<pk>/results/` | Round results (after reveal) |
 | GET | `/api/v1/leaderboard/` | Season leaderboard |
 | GET | `/api/v1/profiles/<username>/` | User profile |
 | GET | `/api/v1/profiles/<username>/achievements/` | User achievements |
+
+### Season recap
+
+`GET /api/v1/seasons/<id>/recap/` returns the authenticated player's existing
+season recap read model. It never returns another player's recap. The response
+uses the normal success envelope and includes `season`, structured `slides`,
+`summary`, and `viewed` fields. Song values are native track objects; standing
+values include `player`, `score`, `place`, `tied`, and `place_label`.
+
+The recap is available only when the season has ended, every non-draft round is
+revealed, and the player either submitted in the season or cast at least one
+counted vote. A missing season returns `404 season_not_found`; an ineligible or
+not-yet-available recap returns `404 recap_unavailable`. Anonymous requests
+return `401 authentication_required`; pending users receive `403
+approval_required`.
+
+Opening the endpoint marks the recap viewed on the server, matching the web
+page-load behavior. The recap remains retrievable after it is viewed. The
+successful response's `viewed` value is `true` because the endpoint has just
+recorded the view.
+
+Archive responses also include a `seasons` collection. Each season has the
+normal season summary plus a personal field:
+
+```json
+"recap": {"available": true, "viewed": false}
+```
+
+`available` is independent of `viewed` and uses the same recap eligibility
+logic.
+
+### Dashboard countdowns
+
+`GET /api/v1/dashboard/` includes a `countdowns` collection before the round
+card data is consumed by the native Home screen:
+
+```json
+"countdowns": [
+  {
+    "id": 12,
+    "title": "Season finale",
+    "target_at": "2026-09-15T20:00:00+00:00",
+    "state": "counting_down"
+  }
+]
+```
+
+The collection contains the same player-visible countdown as the web Home:
+the newest record with `active: true`, ordered by `updated_at` descending and
+primary key descending. If no active record exists it is empty. Target times
+are timezone-aware ISO 8601 timestamps. An active countdown remains in the
+collection after its target time with `state: "expired"`, matching the web's
+“It's time!” behavior. Countdown fields are limited to the id, title, target
+timestamp, and presentation state; admin creator and management fields are
+not exposed. The collection is additive and does not change the existing
+dashboard cards or anonymous/authentication behavior.
 
 ---
 

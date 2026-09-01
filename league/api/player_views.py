@@ -1,5 +1,6 @@
 from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 
 from ..models import Round, Season
 from ..services.achievements import earned_badges, prestige_badges
@@ -11,10 +12,20 @@ from ..services.rounds import (
     round_detail_for_user,
 )
 from ..services.scoring import season_leaderboard
+from ..services import countdowns as countdown_service
+from ..services.recaps import (
+    RecapUnavailable,
+    mark_recap_viewed,
+    recap_has_been_viewed,
+    season_recap_for_user,
+    user_has_recap,
+)
 from .auth import api_methods, api_user_required
 from .responses import error, success
 from .serializers import (
     badge_summary,
+    countdown_summary,
+    recap_payload,
     revealed_submission,
     round_summary,
     season_summary,
@@ -47,11 +58,13 @@ def dashboard(request):
         submission = current.submissions.filter(user=request.user).first()
         if submission:
             mine = submission_track(submission)
+    countdown = countdown_service.active_homepage_countdown()
     return success({
         'cards': cards,
         'current_round': round_summary(current) if current else None,
         'results_round': round_summary(results) if results else None,
         'my_submission': mine,
+        'countdowns': [countdown_summary(countdown)] if countdown else [],
     })
 
 
@@ -65,12 +78,45 @@ def seasons(request):
 @api_methods('GET')
 @api_user_required
 def archive(request):
+    now = timezone.now()
+    seasons = Season.objects.filter(
+        rounds__is_draft=False,
+        rounds__reveal_at__lte=now,
+    ).distinct().order_by('-starts_at', '-id')
     return success({
+        'seasons': [
+            {
+                **season_summary(season),
+                'recap': {
+                    'available': user_has_recap(season, request.user, now=now),
+                    'viewed': recap_has_been_viewed(season, request.user),
+                },
+            }
+            for season in seasons
+        ],
         'rounds': [
             round_summary(round_obj)
             for round_obj in revealed_rounds_for_archive()
         ],
     })
+
+
+@api_methods('GET')
+@api_user_required
+def season_recap(request, pk):
+    season = Season.objects.filter(pk=pk).first()
+    if season is None:
+        return error('season_not_found', 'Season was not found.', 404)
+    try:
+        recap = season_recap_for_user(season, request.user)
+    except RecapUnavailable:
+        return error(
+            'recap_unavailable',
+            'This season recap is not available for you.',
+            404,
+        )
+    mark_recap_viewed(season, request.user)
+    return success({**recap_payload(recap), 'viewed': True})
 
 
 @api_methods('GET')

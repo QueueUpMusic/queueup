@@ -1,3 +1,11 @@
+from decimal import Decimal
+
+from django.utils import timezone
+
+from ..models import Submission
+from ..ranking import RankedItem
+
+
 def iso(value):
     return value.isoformat() if value else None
 
@@ -109,4 +117,44 @@ def badge_summary(row):
         'icon': row['icon'],
         'earned': row['earned'],
         'hidden': row['hidden'],
+    }
+
+
+def _recap_value(value):
+    """Convert the existing recap read model into JSON-safe native data."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Submission):
+        return submission_track(value)
+    if isinstance(value, RankedItem):
+        return {
+            'player': user_summary(value.item),
+            'score': float(value.score),
+            'place': value.place,
+            'tied': value.tied,
+            'place_label': value.label,
+        }
+    if isinstance(value, dict):
+        return {key: _recap_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_recap_value(item) for item in value]
+    return value
+
+
+def recap_payload(recap):
+    """Serialize SeasonRecap without changing its authoritative calculations."""
+    return {
+        'season': season_summary(recap.season),
+        'slides': _recap_value(recap.slides),
+        'summary': _recap_value(recap.summary),
+    }
+
+
+def countdown_summary(countdown, now=None):
+    now = now or timezone.now()
+    return {
+        'id': countdown.pk,
+        'title': countdown.title,
+        'target_at': iso(countdown.target_at),
+        'state': 'expired' if countdown.target_at <= now else 'counting_down',
     }

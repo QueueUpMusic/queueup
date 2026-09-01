@@ -420,6 +420,43 @@ class PlayerReadApiTests(QueueUpTestMixin, TestCase):
             [('results', previous.pk), ('current', self.round.pk)],
         )
 
+    def test_dashboard_countdowns_match_web_visibility_and_order(self):
+        first = HomepageCountdown.objects.create(
+            title='Older', target_at=timezone.now() + timedelta(days=1), active=True,
+        )
+        second = HomepageCountdown.objects.create(
+            title='Newest', target_at=timezone.now() + timedelta(days=2), active=True,
+        )
+        second.updated_at = first.updated_at + timedelta(seconds=1)
+        second.save(update_fields=['updated_at'])
+
+        api = self.client.get(reverse('api-v1:dashboard')).json()['data']
+        self.assertEqual(api['countdowns'], [{
+            'id': second.pk,
+            'title': 'Newest',
+            'target_at': second.target_at.isoformat(),
+            'state': 'counting_down',
+        }])
+        self.assertEqual(self.client.get(reverse('home')).context['countdown'], second)
+
+    def test_dashboard_countdowns_keep_expired_active_countdown_visible(self):
+        countdown = HomepageCountdown.objects.create(
+            title='It is time', target_at=timezone.now() - timedelta(seconds=1), active=True,
+        )
+        data = self.client.get(reverse('api-v1:dashboard')).json()['data']
+        self.assertEqual(data['countdowns'][0]['id'], countdown.pk)
+        self.assertEqual(data['countdowns'][0]['state'], 'expired')
+
+    def test_dashboard_countdowns_exclude_inactive_and_keep_anonymous_behavior(self):
+        HomepageCountdown.objects.create(
+            title='Future inactive', target_at=timezone.now() + timedelta(days=1), active=False,
+        )
+        self.assertEqual(self.client.get(reverse('api-v1:dashboard')).json()['data']['countdowns'], [])
+        self.client.logout()
+        response = self.client.get(reverse('api-v1:dashboard'))
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()['error']['code'], 'authentication_required')
+
     def test_dashboard_round_summary_matches_web_counts_and_host_metadata(self):
         self.bob.first_name = 'Jerry'
         self.bob.save(update_fields=['first_name'])
@@ -4488,6 +4525,80 @@ class SeasonRecapTests(QueueUpTestMixin, TestCase):
         self.assertContains(older, other_round.prompt)
         self.assertNotContains(older, self.round.prompt)
         self.assertNotContains(older, 'View your Older Season Recap')
+
+    def test_recap_api_returns_authoritative_read_model_and_marks_viewed(self):
+        expected = self.populated_recap()
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse('api-v1:season-recap', args=[self.season.pk]))
+        data = response.json()['data']
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(data['season']['id'], self.season.pk)
+        self.assertEqual(data['slides'][0], expected.slides[0])
+        self.assertEqual(data['slides'][-1]['kind'], 'summary')
+        self.assertEqual(data['summary']['podiums'], expected.summary['podiums'])
+        self.assertTrue(data['viewed'])
+        self.assertTrue(SeasonRecapView.objects.filter(user=self.alice, season=self.season).exists())
+        self.assertEqual(
+            self.client.get(reverse('api-v1:season-recap', args=[self.season.pk])).status_code,
+            200,
+        )
+
+    def test_recap_api_eligibility_and_standard_errors(self):
+        anonymous = self.client.get(reverse('api-v1:season-recap', args=[self.season.pk]))
+        self.assertEqual(anonymous.status_code, 401)
+        self.assertEqual(anonymous.json()['error']['code'], 'authentication_required')
+
+        self.client.force_login(self.alice)
+        missing = self.client.get(reverse('api-v1:season-recap', args=[99999]))
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()['error']['code'], 'season_not_found')
+
+        unavailable = self.client.get(reverse('api-v1:season-recap', args=[self.season.pk]))
+        self.assertEqual(unavailable.status_code, 404)
+        self.assertEqual(unavailable.json()['error']['code'], 'recap_unavailable')
+
+        self.add_submission(self.alice, 'eligible-by-submission', 'Artist')
+        self.reveal_season()
+        self.assertEqual(
+            self.client.get(reverse('api-v1:season-recap', args=[self.season.pk])).status_code,
+            200,
+        )
+
+        outsider = User.objects.create_user('recap-api-outsider', password='x')
+        outsider.profile.approved = True
+        outsider.profile.save(update_fields=['approved'])
+        self.client.force_login(outsider)
+        response = self.client.get(reverse('api-v1:season-recap', args=[self.season.pk]))
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()['error']['code'], 'recap_unavailable')
+
+    def test_recap_api_allows_counted_vote_only_participation(self):
+        song = self.add_submission(self.alice, 'vote-only-participation', 'Artist')
+        Vote.objects.create(round=self.round, voter=self.bob, submission=song, score=4)
+        self.reveal_season()
+        self.client.force_login(self.bob)
+
+        response = self.client.get(reverse('api-v1:season-recap', args=[self.season.pk]))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['season']['id'], self.season.pk)
+
+    def test_recap_api_archive_availability_and_viewed_state_are_personal(self):
+        self.populated_recap()
+        self.client.force_login(self.alice)
+        archive = self.client.get(reverse('api-v1:archive')).json()['data']
+        season = next(row for row in archive['seasons'] if row['id'] == self.season.pk)
+        self.assertEqual(season['recap'], {'available': True, 'viewed': False})
+
+        self.client.get(reverse('api-v1:season-recap', args=[self.season.pk]))
+        archive = self.client.get(reverse('api-v1:archive')).json()['data']
+        season = next(row for row in archive['seasons'] if row['id'] == self.season.pk)
+        self.assertEqual(season['recap'], {'available': True, 'viewed': True})
+
+        self.client.force_login(self.bob)
+        archive = self.client.get(reverse('api-v1:archive')).json()['data']
+        season = next(row for row in archive['seasons'] if row['id'] == self.season.pk)
+        self.assertFalse(season['recap']['viewed'])
 
 
 class HomepageCountdownTests(QueueUpTestMixin, TestCase):

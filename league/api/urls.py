@@ -40,6 +40,7 @@ urlpatterns = [
     path('staff/seasons/<int:pk>/', staff_views.season_save, name='staff-season-edit'),
     path('dashboard/', player_views.dashboard, name='dashboard'),
     path('seasons/', player_views.seasons, name='seasons'),
+    path('seasons/<int:pk>/recap/', player_views.season_recap, name='season-recap'),
     path('archive/', player_views.archive, name='archive'),
     path('rounds/<int:pk>/', player_views.round_detail, name='round-detail'),
     path('rounds/<int:pk>/ballot/', player_views.ballot, name='ballot'),
