@@ -1213,6 +1213,60 @@ class StaffReadApiTests(QueueUpTestMixin, TestCase):
         self.assertEqual(data['submitted_count'], 2)
         self.assertEqual(data['completed_count'], 1)
 
+    def test_staff_round_read_includes_edit_schedule_and_host(self):
+        now = timezone.now().replace(microsecond=0)
+        host = User.objects.create_user(
+            'round-host', password='x', first_name='Round Host',
+        )
+        self.round.goes_live_at = now + timedelta(hours=1)
+        self.round.submission_opens = now + timedelta(hours=2)
+        self.round.submission_deadline = now + timedelta(days=1)
+        self.round.voting_deadline = now + timedelta(days=2)
+        self.round.reveal_at = now + timedelta(days=3)
+        self.round.host = host
+        self.round.save()
+
+        self.client.force_login(self.staff)
+        response = self.client.get(reverse('api-v1:staff-rounds'))
+
+        self.assertEqual(response.status_code, 200)
+        current = next(
+            value for value in response.json()['data']['rounds']
+            if value['id'] == self.round.pk
+        )
+        self.assertEqual(current['season_id'], self.season.pk)
+        self.assertEqual(current['prompt'], self.round.prompt)
+        self.assertEqual(current['details'], self.round.details)
+        self.assertEqual(current['goes_live_at'], self.round.goes_live_at.isoformat())
+        self.assertEqual(current['submission_opens'], self.round.submission_opens.isoformat())
+        self.assertEqual(current['submission_deadline'], self.round.submission_deadline.isoformat())
+        self.assertEqual(current['voting_deadline'], self.round.voting_deadline.isoformat())
+        self.assertEqual(current['reveal_at'], self.round.reveal_at.isoformat())
+        self.assertEqual(
+            current['host'], {
+                'id': host.pk,
+                'username': host.username,
+                'display_name': host.first_name,
+                'picture_url': None,
+            },
+        )
+        self.assertIn('state', current)
+        self.assertIn('is_draft', current)
+        self.assertIn('archived', current)
+        self.assertIn('playlist_url', current)
+
+    def test_staff_round_read_preserves_nullable_schedule_and_host(self):
+        self.client.force_login(self.staff)
+        current = next(
+            value for value in self.client.get(
+                reverse('api-v1:staff-rounds')
+            ).json()['data']['rounds']
+            if value['id'] == self.round.pk
+        )
+
+        self.assertIsNone(current['goes_live_at'])
+        self.assertIsNone(current['host'])
+
     def test_player_badge_and_round_search_match_control_pages(self):
         Badge.objects.create(name='Needle Badge', slug='needle-badge', description='Found')
         self.client.force_login(self.staff)

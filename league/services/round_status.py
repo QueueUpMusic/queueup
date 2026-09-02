@@ -29,7 +29,7 @@ def league_player_ids():
 
 def control_rounds_with_status(query=''):
     """Return control-page rounds with authoritative participation totals."""
-    rounds = Round.objects.select_related('season').annotate(
+    rounds = Round.objects.select_related('season', 'host', 'host__profile').annotate(
         submission_count=Count('submissions', distinct=True),
         submitted_player_count=Count('submissions__user', distinct=True),
     ).order_by('-submission_opens')

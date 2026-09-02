@@ -418,6 +418,31 @@ All require `@api_staff_required` (authenticated + staff/superuser).
 - Badges: search by name, description, achievement_key
 - Rounds: search by prompt, details, season name
 
+Each round in the staff rounds response, and the round object returned by the
+staff round create/edit endpoints, includes the editable read fields below in
+addition to the existing fields:
+
+```json
+{
+  "goes_live_at": "2026-08-18T09:00:00-04:00",
+  "submission_opens": "2026-08-18T10:00:00-04:00",
+  "submission_deadline": "2026-08-20T10:00:00-04:00",
+  "voting_deadline": "2026-08-22T10:00:00-04:00",
+  "reveal_at": "2026-08-22T10:05:00-04:00",
+  "host": {
+    "id": 7,
+    "username": "jerry",
+    "display_name": "Jerry",
+    "picture_url": "/media/profile_pictures/2026/08/avatar.jpg"
+  }
+}
+```
+
+All schedule fields are returned as timezone-aware ISO 8601 timestamps. The
+`goes_live_at` field is nullable; the other schedule fields are required by the
+Round model and are non-null. `host` is `null` when no host is assigned, and
+`host.picture_url` is nullable when the host has no profile picture.
+
 ---
 
 ### Staff Command Endpoints

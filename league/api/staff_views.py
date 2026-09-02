@@ -167,10 +167,24 @@ def create_playlist(request, pk):
 
 
 def _round(value):
+    host = None
+    if value.host:
+        host = {
+            'id': value.host.pk,
+            'username': value.host.username,
+            'display_name': value.host.first_name or value.host.username,
+            'picture_url': value.host.profile.picture.url if value.host.profile.picture else None,
+        }
     return {
         'id': value.pk, 'season_id': value.season_id,
         'season': value.season.name, 'prompt': value.prompt,
         'details': value.details, 'state': value.state,
+        'goes_live_at': _iso_datetime(value.goes_live_at),
+        'submission_opens': _iso_datetime(value.submission_opens),
+        'submission_deadline': _iso_datetime(value.submission_deadline),
+        'voting_deadline': _iso_datetime(value.voting_deadline),
+        'reveal_at': _iso_datetime(value.reveal_at),
+        'host': host,
         'is_draft': value.is_draft, 'archived': value.archived,
         'submission_count': getattr(value, 'submission_count', 0),
         'vote_count': getattr(value, 'vote_count', 0),
