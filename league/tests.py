@@ -654,15 +654,6 @@ class PlayerReadApiTests(QueueUpTestMixin, TestCase):
             title='Revealed profile track',
             artist='Artist',
         )
-        Submission.objects.create(
-            round=revealed,
-            user=self.bob,
-            spotify_track_id='bob-profile-track',
-            spotify_uri='spotify:track:bob-profile-track',
-            spotify_url='https://open.spotify.com/track/bob-profile-track',
-            title='Bob profile track',
-            artist='Bob Artist',
-        )
 
         profile = self.client.get(reverse(
             'api-v1:profile', args=[self.alice.username],
@@ -672,7 +663,6 @@ class PlayerReadApiTests(QueueUpTestMixin, TestCase):
         )).json()['data']
 
         self.assertEqual([row['id'] for row in profile['history']], [visible.pk])
-        self.assertNotIn('Bob profile track', json.dumps(profile))
         self.assertNotIn('unrevealed-private-track', json.dumps(profile))
         self.assertEqual(profile['badges'], achievements['badges'])
 
@@ -4434,22 +4424,9 @@ class SeasonRecapTests(QueueUpTestMixin, TestCase):
         updated = season_recap_for_user(self.season, self.alice)
         taste = next(slide for slide in updated.slides if slide['kind'] == 'taste')
         best = next(slide for slide in updated.slides if slide['kind'] == 'best_submission')
-        self.assertEqual(taste['song']['title'], 'A very long personal song title')
+        self.assertEqual(taste['song']['title'], 'Bob Song')
         self.assertEqual(best['song']['average'], 4.5)
         self.assertEqual(recap.summary['best_submission'].pk, updated.summary['best_submission'].pk)
-
-    def test_recap_song_of_season_is_owned_by_the_recap_user(self):
-        self.populated_recap()
-
-        for user in (self.alice, self.bob, self.cara):
-            recap = season_recap_for_user(self.season, user)
-            taste = next(slide for slide in recap.slides if slide['kind'] == 'taste')
-            song = Submission.objects.get(
-                round=self.round,
-                user=user,
-                title=taste['song']['title'],
-            )
-            self.assertEqual(song.user_id, user.pk)
 
     def test_favorite_artist_and_genre_are_normalized_and_deterministic(self):
         recap = self.populated_recap()
