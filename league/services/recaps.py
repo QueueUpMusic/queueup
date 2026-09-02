@@ -121,21 +121,22 @@ def season_recap_for_user(season, user, now=None):
         lambda value: (-float(value[1].score), value[1].place, value[0].title.lower(), value[0].id),
     )
 
-    rated_songs = defaultdict(list)
     artists = defaultdict(list)
     genres = defaultdict(list)
     for vote in my_votes:
         song = vote.submission
         # Counted IDs already enforce both completion and the no-self-vote rule.
-        rated_songs[song.id].append(vote)
         artists[song.artist].append(vote)
         if (genre := main_genre(song.genres)):
             genres[genre].append(vote)
 
-    song_candidates = []
-    for votes in rated_songs.values():
-        song = votes[0].submission
-        song_candidates.append((song, sum(v.score for v in votes) / len(votes), len(votes)))
+    # This is displayed as the player's song of the season. It must be
+    # selected from that player's submissions, rather than from songs they
+    # rated (which can belong to any other player).
+    song_candidates = [
+        (submission, float(entry.score), len(scores))
+        for submission, entry, scores in submission_results
+    ]
     song_of_season = _winner(song_candidates, lambda value: (-value[1], -value[2], value[0].title.lower(), value[0].artist.lower(), value[0].id))
 
     repeated_artists = [(name, votes) for name, votes in artists.items() if len(votes) > 1]
