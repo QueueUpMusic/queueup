@@ -7,11 +7,12 @@ from django.contrib.auth.models import User
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 
-from ..forms import BadgeForm, RoundForm, SeasonForm
-from ..models import Badge, Round, Season, SpotifyConnection
+from ..forms import BadgeForm, HomepageCountdownForm, NotificationBlastForm, RoundForm, SeasonForm
+from ..models import Badge, HomepageCountdown, NotificationBlast, NotificationDelivery, Round, Season, SpotifyConnection
 from ..push import send_user_push
 from ..realtime import broadcast
 from ..services import badges as badge_service
+from ..services import notification_blasts as blast_service
 from ..services import membership as membership_service
 from ..services import round_status as round_status_service
 from ..services import rounds as round_service
@@ -19,6 +20,127 @@ from ..spotify import user_api
 from ..services import staff as staff_service
 from .auth import api_methods, api_staff_required
 from .responses import error, success
+
+
+def _iso_datetime(value):
+    return value.isoformat() if value else None
+
+
+def _countdown(value):
+    return {
+        'id': value.pk,
+        'title': value.title,
+        'target_at': _iso_datetime(value.target_at),
+        'active': value.active,
+        'created_at': _iso_datetime(value.created_at),
+        'updated_at': _iso_datetime(value.updated_at),
+    }
+
+
+def _blast(value):
+    delivery_count = NotificationDelivery.objects.filter(
+        event_key=blast_service.event_key_for_blast(value),
+    ).count()
+    return {
+        'id': value.pk,
+        'title': value.title,
+        'body': value.body,
+        'destination': value.destination,
+        'audience': value.audience,
+        'status': value.status,
+        'scheduled_for': _iso_datetime(value.scheduled_for),
+        'created_at': _iso_datetime(value.created_at),
+        'sent_at': _iso_datetime(value.sent_at),
+        'delivery_count': delivery_count,
+    }
+
+
+def _json_body(request):
+    try:
+        return json.loads(request.body)
+    except (TypeError, ValueError):
+        return None
+
+
+@api_methods('GET', 'POST')
+@api_staff_required
+def countdowns(request):
+    if request.method == 'POST':
+        return countdown_save(request)
+    return success({'countdowns': [
+        _countdown(value) for value in HomepageCountdown.objects.all()
+    ]})
+
+
+@api_methods('POST', 'PATCH', 'DELETE')
+@api_staff_required
+def countdown_save(request, pk=None):
+    countdown = get_object_or_404(HomepageCountdown, pk=pk) if pk else None
+    if request.method == 'DELETE':
+        countdown_id = countdown.pk
+        countdown.delete()
+        return success({'id': countdown_id, 'deleted': True})
+    data = _json_body(request)
+    if not isinstance(data, dict):
+        return error('invalid_json', 'Invalid JSON body.', 400)
+
+    if countdown and request.method == 'PATCH':
+        data = {
+            'title': data.get('title', countdown.title),
+            'target_at': data.get('target_at', countdown.target_at.isoformat()),
+            'active': data.get('active', countdown.active),
+        }
+    form = HomepageCountdownForm(data, instance=countdown)
+    if not form.is_valid():
+        return error('validation_failed', 'Form validation failed.', 400, errors=form.errors.get_json_data())
+
+    countdown = form.save(commit=False)
+    if not countdown.pk:
+        countdown.created_by = request.user
+    countdown.save()
+    return success(_countdown(countdown))
+
+
+@api_methods('GET', 'POST')
+@api_staff_required
+def notifications(request):
+    if request.method == 'POST':
+        return notification_create(request)
+    return success({'notifications': [
+        _blast(value) for value in NotificationBlast.objects.all()
+    ]})
+
+
+@api_methods('POST')
+@api_staff_required
+def notification_create(request):
+    data = _json_body(request)
+    if not isinstance(data, dict):
+        return error('invalid_json', 'Invalid JSON body.', 400)
+
+    action = data.pop('action', None)
+    send_now = action == 'send_now' or not data.get('scheduled_for')
+    if send_now:
+        data['scheduled_for'] = None
+    data.setdefault('destination', '/home/')
+    data.setdefault('audience', NotificationBlast.Audience.APPROVED)
+    form = NotificationBlastForm(data)
+    if not form.is_valid():
+        return error('validation_failed', 'Form validation failed.', 400, errors=form.errors.get_json_data())
+
+    blast = form.save(commit=False)
+    blast.created_by = request.user
+    if send_now:
+        blast.scheduled_for = None
+        blast.status = NotificationBlast.Status.DRAFT
+        blast.save()
+        result = blast_service.send_now(blast)
+        blast.refresh_from_db()
+        return success({'notification': _blast(blast), 'delivery': result})
+
+    blast.status = NotificationBlast.Status.SCHEDULED
+    blast.save()
+    return success(_blast(blast))
 
 
 @api_methods('POST')

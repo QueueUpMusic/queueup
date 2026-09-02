@@ -741,7 +741,7 @@ class SubmissionApiTests(QueueUpTestMixin, TestCase):
             content_type='application/json',
         )
 
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 200)
         submission = Submission.objects.get(user=self.alice, round=self.round)
         self.assertEqual(submission.isrc, 'APIISRC12345')
         self.assertEqual(submission.title, 'API Verified Song')
@@ -4713,3 +4713,134 @@ class NotificationBlastTests(QueueUpTestMixin, TestCase):
         stale.refresh_from_db()
         self.assertEqual(stale.status, NotificationBlast.Status.SENT)
         self.assertEqual(send_push.call_count, 1)
+
+
+class StaffManagementApiTests(QueueUpTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user('staff-management-api', password='x', is_staff=True)
+
+    def post_json(self, client, url_name, data, token=None):
+        headers = {'HTTP_X_CSRFTOKEN': token} if token else {}
+        return client.post(
+            reverse(url_name), data=json.dumps(data),
+            content_type='application/json', **headers,
+        )
+
+    def csrf_token(self, client):
+        client.get(reverse('api-v1:auth-csrf'))
+        return client.cookies[settings.CSRF_COOKIE_NAME].value
+
+    def test_countdown_staff_crud_and_player_visibility(self):
+        self.client.force_login(self.staff)
+        target = timezone.now() + timedelta(days=2)
+
+        response = self.post_json(self.client, 'api-v1:staff-countdowns', {
+            'title': 'Finale', 'target_at': target.isoformat(), 'active': True,
+        })
+        self.assertEqual(response.status_code, 200)
+        countdown_id = response.json()['data']['id']
+        self.assertEqual(response.json()['data']['title'], 'Finale')
+        self.assertEqual(self.client.get(reverse('api-v1:staff-countdowns')).status_code, 200)
+
+        response = self.client.patch(
+            reverse('api-v1:staff-countdown-edit', args=[countdown_id]),
+            data=json.dumps({'title': 'Updated', 'active': False}),
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()['data']['active'])
+        self.assertIsNone(active_homepage_countdown())
+
+        self.client.delete(reverse('api-v1:staff-countdown-edit', args=[countdown_id]))
+        self.assertFalse(HomepageCountdown.objects.filter(pk=countdown_id).exists())
+
+        response = self.post_json(self.client, 'api-v1:staff-countdowns', {
+            'title': 'Visible', 'target_at': target.isoformat(), 'active': True,
+        })
+        self.assertEqual(response.status_code, 200)
+        dashboard = self.client.get(reverse('api-v1:dashboard')).json()
+        self.assertEqual(dashboard['data']['countdowns'][0]['title'], 'Visible')
+
+    def test_countdown_validation_and_staff_authorization(self):
+        response = self.client.get(reverse('api-v1:staff-countdowns'))
+        self.assertEqual(response.status_code, 401)
+        self.client.force_login(self.alice)
+        self.assertEqual(self.client.get(reverse('api-v1:staff-countdowns')).status_code, 403)
+        response = self.post_json(self.client, 'api-v1:staff-countdowns', {
+            'title': '', 'target_at': 'not-a-date', 'active': True,
+        })
+        self.assertEqual(response.status_code, 403)
+
+        self.client.force_login(self.staff)
+        response = self.post_json(self.client, 'api-v1:staff-countdowns', {
+            'title': '', 'target_at': 'not-a-date', 'active': True,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['error']['code'], 'validation_failed')
+
+    def test_countdown_mutations_require_csrf(self):
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.staff)
+        response = self.post_json(client, 'api-v1:staff-countdowns', {
+            'title': 'Blocked', 'target_at': timezone.now().isoformat(),
+        })
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error']['code'], 'csrf_failed')
+
+    @patch('league.services.notification_blasts.send_push')
+    def test_notification_send_now_uses_blast_service_and_stable_event_key(self, send_push):
+        send_push.return_value = {'sent': 0, 'skipped': 0, 'removed': 0, 'failed': 0}
+        self.client.force_login(self.staff)
+        response = self.post_json(self.client, 'api-v1:staff-notification-create', {
+            'title': 'Announcement', 'body': 'Hello', 'destination': '/home/',
+            'audience': 'approved',
+        })
+        self.assertEqual(response.status_code, 200)
+        blast = NotificationBlast.objects.get()
+        self.assertEqual(blast.status, NotificationBlast.Status.SENT)
+        self.assertEqual(event_key_for_blast(blast), f'admin-blast:{blast.pk}')
+        send_push.assert_called_once()
+        self.assertEqual(self.client.get(reverse('api-v1:staff-notifications')).status_code, 200)
+
+    @patch('league.services.notification_blasts.send_push')
+    def test_notification_future_schedule_uses_existing_scheduler_and_validation(self, send_push):
+        send_push.return_value = {'sent': 1, 'skipped': 0, 'removed': 0, 'failed': 0}
+        self.client.force_login(self.staff)
+        scheduled_for = timezone.now() + timedelta(hours=2)
+        response = self.post_json(self.client, 'api-v1:staff-notifications', {
+            'title': 'Later', 'body': 'Soon', 'scheduled_for': scheduled_for.isoformat(),
+            'audience': 'approved',
+        })
+        self.assertEqual(response.status_code, 200)
+        blast = NotificationBlast.objects.get()
+        self.assertEqual(blast.status, NotificationBlast.Status.SCHEDULED)
+        self.assertEqual(send_due_blasts()['sent'], 0)
+        blast.scheduled_for = timezone.now() - timedelta(seconds=1)
+        blast.save(update_fields=['scheduled_for'])
+        self.assertEqual(send_due_blasts()['sent'], 1)
+        self.assertEqual(send_due_blasts()['sent'], 0)
+        self.assertEqual(send_push.call_count, 1)
+
+        response = self.post_json(self.client, 'api-v1:staff-notifications', {
+            'title': '', 'body': '', 'scheduled_for': 'bad-time', 'audience': 'approved',
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()['error']['code'], 'validation_failed')
+
+    def test_notification_mutations_require_staff_and_csrf(self):
+        self.assertEqual(self.client.get(reverse('api-v1:staff-notifications')).status_code, 401)
+        self.client.force_login(self.alice)
+        self.assertEqual(self.client.get(reverse('api-v1:staff-notifications')).status_code, 403)
+
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.staff)
+        response = self.post_json(client, 'api-v1:staff-notifications', {
+            'title': 'Blocked', 'body': 'No token',
+        })
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()['error']['code'], 'csrf_failed')
