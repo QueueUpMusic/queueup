@@ -113,7 +113,7 @@ Additional error fields may be included (e.g., `errors` for form validation).
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | GET | `/api/v1/auth/csrf/` | Anonymous | Issue a CSRF token and cookie |
-| POST | `/api/v1/auth/login/` | Anonymous | Authenticate with a username and password |
+| POST | `/api/v1/auth/login/` | Anonymous | Authenticate with a username or email and password |
 | POST | `/api/v1/auth/signup/` | Anonymous | Create an account and establish a session |
 | POST | `/api/v1/auth/logout/` | Authenticated (pending ok) | End the current session |
 
@@ -121,8 +121,22 @@ Authentication uses Django sessions; these endpoints do not issue JWTs or API
 tokens. All POST requests require the CSRF token from the `csrftoken` cookie
 (the configured cookie name may differ) in the `X-CSRFToken` header.
 
-`/api/v1/auth/login/` accepts `{ "username": "...", "password": "..." }`.
-Successful login returns the same session data shape documented below.
+`/api/v1/auth/login/` accepts the preferred request shape:
+
+```json
+{
+  "identifier": "username-or-email",
+  "password": "..."
+}
+```
+
+The legacy `{ "username": "...", "password": "..." }` shape remains
+supported for compatibility. `identifier` may be either a username or an
+email address. Username matching preserves existing behavior; email matching
+is case-insensitive and succeeds only when exactly one account has that email.
+An unknown username, unknown email, wrong password, or ambiguous duplicate
+email returns the same generic invalid-login validation response. Successful
+login returns the same session data shape documented below.
 
 `/api/v1/auth/signup/` accepts:
 

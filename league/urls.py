@@ -7,6 +7,7 @@ from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import ensure_csrf_cookie
 
 from . import views
+from .forms import QueueUpAuthenticationForm
 
 urlpatterns = [
     path('api/v1/', include('league.api.urls')),
@@ -17,7 +18,9 @@ urlpatterns = [
     path('waiting-for-approval/', views.waiting_approval, name='waiting_approval'),
     path('terms/', views.terms, name='terms'),
     path('privacy/', views.privacy, name='privacy'),
-    path('login/', never_cache(ensure_csrf_cookie(LoginView.as_view(template_name='league/login.html'))), name='login'),
+    path('login/', never_cache(ensure_csrf_cookie(LoginView.as_view(
+        template_name='league/login.html', form_class=QueueUpAuthenticationForm,
+    ))), name='login'),
     path('logout/', LogoutView.as_view(), name='logout'),
     path('password-reset/', PasswordResetView.as_view(
         template_name='league/password_reset_form.html',

@@ -231,6 +231,50 @@ class ApiNativeAuthTests(QueueUpTestMixin, TestCase):
         self.assertTrue(response.json()['data']['user']['approved'])
         self.assertTrue(client.get(reverse('api-v1:session')).json()['data']['authenticated'])
 
+    def test_login_accepts_email_case_insensitively(self):
+        self.alice.email = 'micah@example.com'
+        self.alice.save(update_fields=['email'])
+        client, token = self.csrf_client()
+
+        response = self.post_json(client, 'api-v1:auth-login', {
+            'identifier': 'MICAH@EXAMPLE.COM', 'password': 'x',
+        }, token)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['data']['user']['id'], self.alice.pk)
+        self.assertEqual(response.json()['data']['user']['username'], 'alice')
+
+    def test_login_rejects_ambiguous_email_without_revealing_accounts(self):
+        self.alice.email = 'shared@example.com'
+        self.alice.save(update_fields=['email'])
+        User.objects.create_user('shared-email-user', email='shared@example.com', password='x')
+        client, token = self.csrf_client()
+
+        response = self.post_json(client, 'api-v1:auth-login', {
+            'identifier': 'shared@example.com', 'password': 'x',
+        }, token)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.json()['ok'])
+        self.assertIn('errors', response.json()['error'])
+
+    def test_login_rejects_unknown_username_and_email_generically(self):
+        client, token = self.csrf_client()
+
+        responses = [
+            self.post_json(client, 'api-v1:auth-login', {
+                'identifier': 'no-such-user', 'password': 'x',
+            }, token),
+            self.post_json(client, 'api-v1:auth-login', {
+                'identifier': 'nobody@example.com', 'password': 'x',
+            }, token),
+        ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, 400)
+            self.assertFalse(response.json()['ok'])
+            self.assertIn('errors', response.json()['error'])
+
     def test_login_accepts_pending_user_without_approval(self):
         pending = User.objects.create_user('pending-login', password='x')
         client, token = self.csrf_client()
@@ -277,6 +321,17 @@ class ApiNativeAuthTests(QueueUpTestMixin, TestCase):
 
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()['error']['code'], 'csrf_failed')
+
+    def test_web_login_accepts_email(self):
+        self.alice.email = 'web-login@example.com'
+        self.alice.save(update_fields=['email'])
+
+        response = self.client.post(reverse('login'), {
+            'username': 'WEB-LOGIN@EXAMPLE.COM', 'password': 'x',
+        })
+
+        self.assertRedirects(response, reverse('home'))
+        self.assertEqual(self.client.session.get('_auth_user_id'), str(self.alice.pk))
 
     def test_signup_logs_user_in_but_leaves_user_pending(self):
         client, token = self.csrf_client()

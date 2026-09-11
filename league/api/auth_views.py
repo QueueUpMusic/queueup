@@ -1,10 +1,9 @@
 import json
 
 from django.contrib.auth import login, logout
-from django.contrib.auth.forms import AuthenticationForm
 from django.middleware.csrf import get_token
 
-from ..forms import SignupForm
+from ..forms import QueueUpAuthenticationForm, SignupForm
 from ..services import membership as membership_service
 from .auth import api_methods, api_user_required
 from .responses import error, success
@@ -46,8 +45,8 @@ def login_user(request):
     if body is None:
         return error('invalid_json', 'A JSON object is required.', 400)
 
-    form = AuthenticationForm(request=request, data={
-        'username': body.get('username', ''),
+    form = QueueUpAuthenticationForm(request=request, data={
+        'username': body.get('identifier', body.get('username', '')),
         'password': body.get('password', ''),
     })
     if not form.is_valid():

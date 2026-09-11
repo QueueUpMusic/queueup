@@ -1,5 +1,5 @@
 from django import forms
-from django.contrib.auth.forms import UserCreationForm
+from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.contrib.auth.models import User
 from django.utils import timezone
 
@@ -23,6 +23,27 @@ class SignupForm(UserCreationForm):
         if commit:
             user.save()
         return user
+
+
+class QueueUpAuthenticationForm(AuthenticationForm):
+    """Authenticate by username, or by an unambiguous email address."""
+
+    username = forms.CharField(label='Username or email')
+
+    def clean(self):
+        identifier = self.cleaned_data.get('username')
+        if identifier:
+            username_match = User.objects.filter(username=identifier).exists()
+            if not username_match:
+                email_matches = list(
+                    User.objects.filter(email__iexact=identifier)
+                    .values_list('username', flat=True)[:2]
+                )
+                if len(email_matches) == 1:
+                    self.cleaned_data['username'] = email_matches[0]
+                # Zero or multiple email matches deliberately remain invalid
+                # through AuthenticationForm's normal authentication path.
+        return super().clean()
 
 
 class VoteForm(forms.ModelForm):
