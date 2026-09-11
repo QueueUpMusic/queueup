@@ -67,6 +67,25 @@ def global_notification_audience():
     )
 
 
+def native_global_notification_audience():
+    return User.objects.filter(models.Q(is_staff=True) | models.Q(profile__approved=True), is_active=True)
+
+
+def native_audience_for_round_event(round_obj, event_key):
+    if event_key.endswith('submission-reminder-6h'):
+        submitted_ids = Submission.objects.filter(round=round_obj).values_list('user_id', flat=True)
+        return User.objects.filter(is_active=True).exclude(id__in=submitted_ids)
+    if event_key.endswith('voting-reminder-6h'):
+        users = User.objects.filter(is_active=True, profile__approved=True)
+        incomplete = []
+        for user in users.iterator():
+            ballot = ballot_for_user(round_obj, user)
+            if not ballot.complete and not ballot.no_votable_songs:
+                incomplete.append(user)
+        return incomplete
+    return native_global_notification_audience()
+
+
 def submission_reminder_audience(round_obj):
     """Return active subscribers who have not submitted to this round."""
     submitted_ids = Submission.objects.filter(round=round_obj).values_list(

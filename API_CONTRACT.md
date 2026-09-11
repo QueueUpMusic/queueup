@@ -357,6 +357,15 @@ dashboard cards or anonymous/authentication behavior.
 | POST,DELETE | `/api/v1/profile/picture/` | Required | Set/remove profile picture |
 | GET | `/api/v1/notifications/` | Required | Get notification preferences |
 | POST,DELETE | `/api/v1/push/subscriptions/` | Required | Manage push subscriptions |
+| POST | `/api/v1/mobile/push/register/` | Required | Register or refresh an Expo native device token |
+| POST | `/api/v1/mobile/push/unregister/` | Required | Unregister the authenticated native device token |
+
+Native registration accepts JSON with `expo_push_token`, `platform` (`ios` or
+`android`), and optional `device_id` and `app_version`. The token is unique
+across accounts and is safely reassigned when a different authenticated user
+registers it. Registration is idempotent and re-enables the device. Native
+delivery uses a separate `NativePushDevice`/`NativeNotificationDelivery`
+transport and does not affect browser PushSubscription delivery.
 
 **`/api/v1/profile/` Request:**
 

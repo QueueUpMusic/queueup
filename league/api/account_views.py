@@ -7,6 +7,7 @@ from ..forms import ProfileApiForm, ProfileForm, ProfilePictureForm
 from ..services import media as media_service
 from ..services import membership as membership_service
 from ..services import notifications as notification_service
+from ..services import native_push as native_push_service
 from .auth import api_methods, api_user_required
 from .responses import error, success
 
@@ -198,3 +199,25 @@ def push_subscriptions(request):
             'endpoint': subscription.endpoint,
         },
     }, status=201)
+
+
+@api_methods('POST')
+@api_user_required
+def register_native_push(request):
+    body = _json_body(request)
+    if body is None:
+        return error('invalid_json', 'A JSON object is required.', 400)
+    try:
+        device = native_push_service.register_device(request.user, body)
+    except native_push_service.InvalidNativePushDevice as exc:
+        return error('invalid_native_push_device', str(exc), 400)
+    return success({'device': {'expo_push_token': device.expo_push_token, 'platform': device.platform, 'enabled': device.enabled}})
+
+
+@api_methods('POST')
+@api_user_required
+def unregister_native_push(request):
+    body = _json_body(request)
+    if body is None:
+        return error('invalid_json', 'A JSON object is required.', 400)
+    return success({'removed': native_push_service.unregister_device(request.user, body.get('expo_push_token'))})

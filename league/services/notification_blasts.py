@@ -7,6 +7,8 @@ from django.utils import timezone
 from ..models import NotificationBlast
 from ..models import PushSubscription
 from ..push import send_push
+from .native_push import send_native_push
+from django.contrib.auth.models import User
 
 
 SENDING_LEASE = timedelta(minutes=15)
@@ -15,6 +17,10 @@ SENDING_LEASE = timedelta(minutes=15)
 def audience_for_blast(blast):
     # The first audience is intentionally only approved players, not arbitrary filters.
     return PushSubscription.objects.filter(user__is_active=True, user__profile__approved=True)
+
+
+def native_audience_for_blast(blast):
+    return User.objects.filter(is_active=True, profile__approved=True)
 
 
 def event_key_for_blast(blast):
@@ -53,10 +59,16 @@ def send_claimed_blast(blast, stderr=None):
             status=NotificationBlast.Status.SCHEDULED, sending_started_at=None,
         )
         raise
+    try:
+        native_result = send_native_push(native_audience_for_blast(blast), event_key_for_blast(blast), blast.title, blast.body, blast.destination, stderr=stderr)
+    except Exception as exc:
+        native_result = {'sent': 0, 'skipped': 0, 'removed': 0, 'failed': 0}
+        if stderr:
+            stderr.write(f'Native push delivery failed: {str(exc)[:200]}\n')
     NotificationBlast.objects.filter(pk=blast.pk, status=NotificationBlast.Status.SENDING).update(
         status=NotificationBlast.Status.SENT, sending_started_at=None, sent_at=timezone.now(),
     )
-    return result
+    return {key: result.get(key, 0) + native_result.get(key, 0) for key in result}
 
 
 def send_now(blast, stderr=None):

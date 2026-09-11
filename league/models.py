@@ -265,6 +265,41 @@ class NotificationDelivery(models.Model):
         return f'{self.event_key} -> {self.subscription_id}'
 
 
+class NativePushDevice(models.Model):
+    class Platform(models.TextChoices):
+        IOS = 'ios', 'iOS'
+        ANDROID = 'android', 'Android'
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='native_push_devices')
+    expo_push_token = models.CharField(max_length=255, unique=True)
+    platform = models.CharField(max_length=8, choices=Platform.choices)
+    device_id = models.CharField(max_length=255, blank=True)
+    app_version = models.CharField(max_length=64, blank=True)
+    enabled = models.BooleanField(default=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['user', 'enabled'], name='league_nati_user_id_8f3f5c_idx')]
+
+
+class NativeNotificationDelivery(models.Model):
+    device = models.ForeignKey(NativePushDevice, on_delete=models.CASCADE, related_name='deliveries')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='native_notification_deliveries')
+    event_key = models.CharField(max_length=200)
+    title = models.CharField(max_length=160)
+    body = models.TextField(max_length=1000)
+    expo_ticket_id = models.CharField(max_length=255, blank=True)
+    status = models.CharField(max_length=32, default='pending')
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['device', 'event_key'], name='one_native_delivery_per_event')]
+
+
 class SpotifyConnection(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='spotify_connection')
     spotify_user_id = models.CharField(max_length=128, blank=True)
