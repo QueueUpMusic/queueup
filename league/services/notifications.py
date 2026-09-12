@@ -204,7 +204,7 @@ def achievement_notification_events():
                 badge['description'],
                 f'/stats/{user.username}/',
                 unlock,
-                unlock.created_at,
+                unlock.earned_at,
             )
 
 

@@ -2565,6 +2565,7 @@ class NotificationTests(QueueUpTestMixin, TestCase):
         self.assertEqual(event.event_key, f'achievement:{unlock.pk}')
         self.assertEqual(event.title, 'Badge unlocked')
         self.assertEqual(event.url, '/stats/alice/')
+        self.assertEqual(event.actionable_at, unlock.earned_at)
 
     @patch('league.push.webpush')
     def test_submitter_not_sent_submission_reminder(self, mocked_push):
