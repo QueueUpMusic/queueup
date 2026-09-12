@@ -6,7 +6,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from .models import NativeNotificationDelivery, NativePushDevice
-from .services.native_push import register_device, send_native_push, unregister_device
+from .services.native_push import native_mobile_route, register_device, send_native_push, unregister_device
 
 
 class NativePushInstallationTests(TestCase):
@@ -72,3 +72,10 @@ class NativePushInstallationTests(TestCase):
         self.assertEqual(result['removed'], 1)
         self.assertFalse(device.enabled)
         self.assertIsNotNone(device.invalidated_at)
+
+    def test_shared_web_destinations_are_normalized_for_native_payloads(self):
+        self.assertEqual(native_mobile_route('/home/'), '/')
+        self.assertEqual(native_mobile_route('/stats/alice/'), '/profile/alice')
+        self.assertEqual(native_mobile_route('/seasons/4/recap/'), '/season/4/recap')
+        self.assertEqual(native_mobile_route('/round/12/vote/'), '/round/12/vote')
+        self.assertEqual(native_mobile_route('/not-a-mobile-route/'), '/')

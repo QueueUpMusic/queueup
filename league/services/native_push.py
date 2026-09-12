@@ -1,5 +1,6 @@
 import re
 import uuid
+from urllib.parse import quote
 
 from django.db import transaction
 from django.utils import timezone
@@ -16,6 +17,28 @@ class InvalidNativePushDevice(Exception):
 
 def _text(value, limit):
     return str(value or '')[:limit]
+
+
+def native_mobile_route(route):
+    """Convert shared web notification destinations to safe mobile routes."""
+    if not isinstance(route, str):
+        return '/'
+    route = route.strip()
+    if route in ('', '/', '/home', '/home/'):
+        return '/'
+    stats_match = re.fullmatch(r'/stats/([^/]+)/?', route)
+    if stats_match:
+        return f"/profile/{quote(stats_match.group(1), safe='')}"
+    recap_match = re.fullmatch(r'/seasons/(\d+)/recap/?', route)
+    if recap_match:
+        return f'/season/{recap_match.group(1)}/recap'
+    if re.fullmatch(r'/round/\d+(?:/(?:submit|vote))?/?', route):
+        return route.rstrip('/')
+    if re.fullmatch(r'/season/\d+/recap/?', route):
+        return route.rstrip('/')
+    if route == '/profile' or re.fullmatch(r'/profile/[A-Za-z0-9_.-]+/?', route):
+        return route.rstrip('/') or '/profile'
+    return '/'
 
 
 @transaction.atomic
@@ -105,9 +128,10 @@ def send_native_push(users, event_key, title, body, route='/home/', *, event_at=
             pending.append((device, delivery))
     if not pending:
         return result
+    mobile_route = native_mobile_route(route)
     try:
         import requests
-        response = requests.post(EXPO_PUSH_URL, json=[{'to': device.expo_push_token, 'title': title, 'body': body, 'data': {'type': event_key.split(':', 1)[0], 'event_key': event_key, 'route': route}, 'sound': 'default'} for device, _ in pending], timeout=10)
+        response = requests.post(EXPO_PUSH_URL, json=[{'to': device.expo_push_token, 'title': title, 'body': body, 'data': {'type': event_key.split(':', 1)[0], 'event_key': event_key, 'route': mobile_route}, 'sound': 'default'} for device, _ in pending], timeout=10)
         response.raise_for_status()
         tickets = response.json().get('data', [])
     except Exception as exc:
