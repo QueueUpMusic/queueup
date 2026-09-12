@@ -64,6 +64,7 @@ def onboarding_state(request):
             profile.submission_rules_accepted_at
         ),
         'native_push_prompt_seen': bool(profile.native_push_prompt_seen_at),
+        'native_notifications_enabled': profile.native_notifications_enabled,
     })
 
 
@@ -222,7 +223,7 @@ def register_native_push(request):
         device = native_push_service.register_device(request.user, body)
     except native_push_service.InvalidNativePushDevice as exc:
         return error('invalid_native_push_device', str(exc), 400)
-    return success({'device': {'expo_push_token': device.expo_push_token, 'platform': device.platform, 'enabled': device.enabled}})
+    return success({'device': {'expo_push_token': device.expo_push_token, 'installation_id': device.installation_id, 'platform': device.platform, 'enabled': device.enabled}})
 
 
 @api_methods('POST')
@@ -232,6 +233,15 @@ def unregister_native_push(request):
     if body is None:
         return error('invalid_json', 'A JSON object is required.', 400)
     return success({'removed': native_push_service.unregister_device(request.user, body.get('expo_push_token'))})
+
+
+@api_methods('POST')
+@api_user_required
+def disable_native_push(request):
+    body = _json_body(request)
+    if body is None:
+        return error('invalid_json', 'A JSON object is required.', 400)
+    return success({'disabled': native_push_service.unregister_device(request.user, body.get('expo_push_token'), disable_preference=True)})
 
 
 @api_methods('POST')

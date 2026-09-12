@@ -360,14 +360,25 @@ dashboard cards or anonymous/authentication behavior.
 | POST,DELETE | `/api/v1/push/subscriptions/` | Required | Manage push subscriptions |
 | POST | `/api/v1/mobile/push/register/` | Required | Register or refresh an Expo native device token |
 | POST | `/api/v1/mobile/push/unregister/` | Required | Unregister the authenticated native device token |
+| POST | `/api/v1/mobile/push/disable/` | Required | Disable QueueUp native notifications for this user and device |
 | POST | `/api/v1/mobile/push/status/` | Required | Check whether this native device token is active for the authenticated user |
 
-Native registration accepts JSON with `expo_push_token`, `platform` (`ios` or
-`android`), and optional `device_id` and `app_version`. The token is unique
-across accounts and is safely reassigned when a different authenticated user
-registers it. Registration is idempotent and re-enables the device. Native
-delivery uses a separate `NativePushDevice`/`NativeNotificationDelivery`
-transport and does not affect browser PushSubscription delivery.
+Native registration accepts JSON with required `expo_push_token`,
+`installation_id` (a stable app-install identifier), and `platform` (`ios` or
+`android`), plus optional `device_id` and `app_version`. The installation is
+the device identity: registration is idempotent, token rollover updates the
+same installation, and an installation can be safely reassigned when another
+authenticated user logs in. Registration enables the account preference only
+after the backend registration succeeds. Native delivery uses a separate
+`NativePushDevice`/`NativeNotificationDelivery` transport and does not affect
+browser PushSubscription delivery.
+
+Native devices have an explicit registration boundary. Events whose actionable
+time predates `registered_at` are not backfilled to a newly enabled device;
+registration itself never runs notification generation. `disable` turns off
+the QueueUp preference and this installation, while `unregister` disables only
+the current installation and preserves the account preference. Status reports
+whether the supplied token is active for the authenticated user.
 
 The onboarding response also includes `native_push_prompt_seen`, an
 account-level acknowledgement independent of the submission and voting guides.

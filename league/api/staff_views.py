@@ -8,7 +8,7 @@ from django.shortcuts import get_object_or_404
 from django.urls import reverse
 
 from ..forms import BadgeForm, HomepageCountdownForm, NotificationBlastForm, RoundForm, SeasonForm
-from ..models import Badge, HomepageCountdown, NotificationBlast, NotificationDelivery, Round, Season, SpotifyConnection
+from ..models import Badge, HomepageCountdown, NativeNotificationDelivery, NativePushDevice, NotificationBlast, NotificationDelivery, PushSubscription, Round, Season, SpotifyConnection
 from ..push import send_user_push
 from ..realtime import broadcast
 from ..services import badges as badge_service
@@ -38,8 +38,12 @@ def _countdown(value):
 
 
 def _blast(value):
+    eligible_users = User.objects.filter(is_active=True, profile__approved=True)
     delivery_count = NotificationDelivery.objects.filter(
         event_key=blast_service.event_key_for_blast(value),
+    ).count()
+    native_delivery_count = NativeNotificationDelivery.objects.filter(
+        event_key=blast_service.event_key_for_blast(value), status='sent',
     ).count()
     return {
         'id': value.pk,
@@ -52,6 +56,15 @@ def _blast(value):
         'created_at': _iso_datetime(value.created_at),
         'sent_at': _iso_datetime(value.sent_at),
         'delivery_count': delivery_count,
+        'native_delivery_count': native_delivery_count,
+        'eligible_user_count': eligible_users.count(),
+        'native_device_count': NativePushDevice.objects.filter(
+            user__in=eligible_users, user__profile__native_notifications_enabled=True,
+            enabled=True, invalidated_at__isnull=True, registered_at__isnull=False,
+        ).count(),
+        'legacy_web_subscription_count': PushSubscription.objects.filter(
+            user__in=eligible_users,
+        ).count(),
     }
 
 
@@ -211,6 +224,13 @@ def overview(request):
         'badge_count': Badge.objects.count(),
         'season_count': Season.objects.count(),
         'user_count': User.objects.count(),
+        'native_device_count': NativePushDevice.objects.filter(
+            user__is_active=True, user__profile__native_notifications_enabled=True,
+            enabled=True, invalidated_at__isnull=True, registered_at__isnull=False,
+        ).count(),
+        'legacy_web_subscription_count': PushSubscription.objects.filter(
+            user__is_active=True,
+        ).count(),
         'signup_url': signup_url,
         'signup_qr': qr_data,
         'spotify_connection': {

@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.test import Client, TestCase
+from django.utils import timezone
 from django.urls import reverse
 
 from .models import NativePushDevice, NativeNotificationDelivery
@@ -33,7 +34,7 @@ class NativePushApiTests(TestCase):
     def test_registration_is_idempotent_and_reassigns_token(self):
         client = Client(enforce_csrf_checks=True)
         client.force_login(self.user)
-        payload = {'expo_push_token': 'ExponentPushToken[abc]', 'platform': 'android', 'app_version': '1.0'}
+        payload = {'expo_push_token': 'ExponentPushToken[abc]', 'installation_id': 'test-installation', 'platform': 'android', 'app_version': '1.0'}
         self.assertEqual(self.post(client, 'api-v1:mobile-push-register', payload).status_code, 200)
         self.assertEqual(self.post(client, 'api-v1:mobile-push-register', payload).status_code, 200)
         self.assertEqual(NativePushDevice.objects.count(), 1)
@@ -42,18 +43,21 @@ class NativePushApiTests(TestCase):
         self.assertEqual(NativePushDevice.objects.get().user, self.other)
 
     def test_unregister_only_removes_authenticated_users_device(self):
-        device = NativePushDevice.objects.create(user=self.user, expo_push_token='ExpoPushToken[abc]', platform='ios')
+        device = NativePushDevice.objects.create(user=self.user, installation_id='unregister-installation', expo_push_token='ExpoPushToken[abc]', platform='ios')
         client = Client(enforce_csrf_checks=True)
         client.force_login(self.other)
         self.post(client, 'api-v1:mobile-push-unregister', {'expo_push_token': device.expo_push_token})
         self.assertTrue(NativePushDevice.objects.filter(pk=device.pk).exists())
         client.force_login(self.user)
         self.post(client, 'api-v1:mobile-push-unregister', {'expo_push_token': device.expo_push_token})
-        self.assertFalse(NativePushDevice.objects.filter(pk=device.pk).exists())
+        device.refresh_from_db()
+        self.assertFalse(device.enabled)
 
     @patch('requests.post')
     def test_native_delivery_is_deduplicated_and_invalid_devices_are_disabled(self, post):
-        device = NativePushDevice.objects.create(user=self.user, expo_push_token='ExpoPushToken[abc]', platform='android')
+        device = NativePushDevice.objects.create(user=self.user, installation_id='delivery-installation', expo_push_token='ExpoPushToken[abc]', platform='android', registered_at=timezone.now())
+        self.user.profile.native_notifications_enabled = True
+        self.user.profile.save(update_fields=['native_notifications_enabled'])
         post.return_value.raise_for_status.return_value = None
         post.return_value.json.return_value = {'data': [{'status': 'ok', 'id': 'ticket-1'}]}
         first = send_native_push([self.user], 'round:1:voting-open', 'Voting open', 'Rate songs')

@@ -28,9 +28,9 @@ class Command(BaseCommand):
     def send_user(self, user, event_key, title, body, url='/stats/'):
         return send_user_push(user, event_key, title, body, url, self.stderr)
 
-    def send_native(self, users, event_key, title, body, url='/home/'):
+    def send_native(self, users, event_key, title, body, url='/home/', event_at=None):
         try:
-            return send_native_push(users, event_key, title, body, url, stderr=self.stderr)
+            return send_native_push(users, event_key, title, body, url, event_at=event_at, stderr=self.stderr)
         except Exception as exc:
             self.stderr.write(f'Native push delivery failed: {str(exc)[:200]}\n')
             return {'sent': 0, 'skipped': 0, 'removed': 0, 'failed': 0}
@@ -52,7 +52,7 @@ class Command(BaseCommand):
                     event.body,
                     event.url,
                 ))
-                merge(self.send_native(native_audience_for_round_event(rnd, event.event_key), event.event_key, event.title, event.body, event.url))
+                merge(self.send_native(native_audience_for_round_event(rnd, event.event_key), event.event_key, event.title, event.body, event.url, event.actionable_at))
 
         for event in achievement_notification_events():
             result = self.send_user(
@@ -63,7 +63,7 @@ class Command(BaseCommand):
                 event.url,
             )
             merge(result)
-            native = self.send_native(event.user, event.event_key, event.title, event.body, event.url)
+            native = self.send_native(event.user, event.event_key, event.title, event.body, event.url, event.actionable_at)
             merge(native)
             if result['sent'] and not event.unlock.notification_sent_at:
                 event.unlock.notification_sent_at = now
@@ -74,7 +74,7 @@ class Command(BaseCommand):
             season_id = event.event_key.split(':')[1]
             native_url = f'/season/{season_id}/recap'
             user = User.objects.filter(pk=event.event_key.rsplit(':', 1)[-1])
-            merge(self.send_native(user, event.event_key, event.title, event.body, native_url))
+            merge(self.send_native(user, event.event_key, event.title, event.body, native_url, event.actionable_at))
 
         merge(send_due_blasts(self.stderr))
 

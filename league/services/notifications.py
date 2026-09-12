@@ -47,6 +47,7 @@ class PushNotificationEvent:
     title: str
     body: str
     url: str
+    actionable_at: object = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class UserNotificationEvent:
     body: str
     url: str
     unlock: AchievementUnlock
+    actionable_at: object = None
 
 
 def global_notification_audience():
@@ -120,6 +122,7 @@ def round_notification_events(round_obj, now):
         'New round is live',
         f'“{round_obj.prompt}” is opening soon. Check the prompt and deadlines.',
         round_url,
+        round_obj.goes_live_at or round_obj.submission_opens,
     )]
 
     if round_obj.submission_opens <= now < round_obj.submission_deadline:
@@ -129,6 +132,7 @@ def round_notification_events(round_obj, now):
             'Submit your song',
             round_obj.prompt,
             round_url,
+            round_obj.submission_opens,
         ))
 
     if (
@@ -142,6 +146,7 @@ def round_notification_events(round_obj, now):
             '6 hours left to submit',
             f'Choose a clean song for “{round_obj.prompt}” before submissions close.',
             round_url,
+            round_obj.submission_deadline - REMINDER_WINDOW,
         ))
 
     if round_obj.submission_deadline <= now < round_obj.voting_deadline:
@@ -151,6 +156,7 @@ def round_notification_events(round_obj, now):
             'Voting open',
             f'Rate the songs for “{round_obj.prompt}”.',
             round_url,
+            round_obj.submission_deadline,
         ))
 
     if (
@@ -164,6 +170,7 @@ def round_notification_events(round_obj, now):
             '6 hours left to vote',
             f'Finish rating the songs for “{round_obj.prompt}”.',
             round_url,
+            round_obj.voting_deadline - REMINDER_WINDOW,
         ))
 
     if round_obj.reveal_at <= now:
@@ -173,6 +180,7 @@ def round_notification_events(round_obj, now):
             'Results ready',
             f'See who won “{round_obj.prompt}”.',
             round_url,
+            round_obj.reveal_at,
         ))
 
     return events
@@ -196,6 +204,7 @@ def achievement_notification_events():
                 badge['description'],
                 f'/stats/{user.username}/',
                 unlock,
+                unlock.created_at,
             )
 
 
@@ -217,4 +226,5 @@ def recap_notification_events(now):
                 'Your QueueUp Season Recap is ready',
                 'Check out your season recap.',
                 f'/seasons/{season.pk}/recap/',
+                max((round_obj.reveal_at for round_obj in season.rounds.all()), default=season.ends_at),
             )

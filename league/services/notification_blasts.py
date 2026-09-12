@@ -60,15 +60,22 @@ def send_claimed_blast(blast, stderr=None):
         )
         raise
     try:
-        native_result = send_native_push(native_audience_for_blast(blast), event_key_for_blast(blast), blast.title, blast.body, blast.destination, stderr=stderr)
+        native_result = send_native_push(native_audience_for_blast(blast), event_key_for_blast(blast), blast.title, blast.body, blast.destination, event_at=timezone.now(), stderr=stderr)
     except Exception as exc:
-        native_result = {'sent': 0, 'skipped': 0, 'removed': 0, 'failed': 0}
+        native_result = {'devices_targeted': 0, 'sent': 0, 'skipped': 0, 'removed': 0, 'failed': 0}
         if stderr:
             stderr.write(f'Native push delivery failed: {str(exc)[:200]}\n')
     NotificationBlast.objects.filter(pk=blast.pk, status=NotificationBlast.Status.SENDING).update(
         status=NotificationBlast.Status.SENT, sending_started_at=None, sent_at=timezone.now(),
     )
-    return {key: result.get(key, 0) + native_result.get(key, 0) for key in result}
+    return {
+        **{key: result.get(key, 0) for key in result},
+        'native_devices_targeted': native_result.get('devices_targeted', 0),
+        'native_sent': native_result.get('sent', 0),
+        'native_skipped': native_result.get('skipped', 0),
+        'native_failed': native_result.get('failed', 0),
+        'native_removed': native_result.get('removed', 0),
+    }
 
 
 def send_now(blast, stderr=None):

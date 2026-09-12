@@ -13,6 +13,7 @@ class UserProfile(models.Model):
     voting_guide_seen = models.BooleanField(default=False)
     submission_rules_accepted_at = models.DateTimeField(null=True, blank=True)
     native_push_prompt_seen_at = models.DateTimeField(null=True, blank=True)
+    native_notifications_enabled = models.BooleanField(default=False)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -272,11 +273,15 @@ class NativePushDevice(models.Model):
         ANDROID = 'android', 'Android'
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='native_push_devices')
+    installation_id = models.CharField(max_length=128, unique=True, null=True, blank=True)
     expo_push_token = models.CharField(max_length=255, unique=True)
     platform = models.CharField(max_length=8, choices=Platform.choices)
     device_id = models.CharField(max_length=255, blank=True)
     app_version = models.CharField(max_length=64, blank=True)
     enabled = models.BooleanField(default=True)
+    registered_at = models.DateTimeField(null=True, blank=True)
+    disabled_at = models.DateTimeField(null=True, blank=True)
+    invalidated_at = models.DateTimeField(null=True, blank=True)
     last_seen_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -23,6 +23,7 @@ urlpatterns = [
     path('push/subscriptions/', account_views.push_subscriptions, name='push-subscriptions'),
     path('mobile/push/register/', account_views.register_native_push, name='mobile-push-register'),
     path('mobile/push/unregister/', account_views.unregister_native_push, name='mobile-push-unregister'),
+    path('mobile/push/disable/', account_views.disable_native_push, name='mobile-push-disable'),
     path('mobile/push/status/', account_views.native_push_status, name='mobile-push-status'),
     path('staff/', staff_views.overview, name='staff-overview'),
     path('staff/rounds/', staff_views.rounds, name='staff-rounds'),
