@@ -1,5 +1,6 @@
 import json
 from urllib.parse import unquote
+from django.utils import timezone
 
 from django.conf import settings
 
@@ -62,6 +63,7 @@ def onboarding_state(request):
         'submission_rules_accepted': bool(
             profile.submission_rules_accepted_at
         ),
+        'native_push_prompt_seen': bool(profile.native_push_prompt_seen_at),
     })
 
 
@@ -97,6 +99,15 @@ def accept_submission_rules(request):
         'submission_rules_accepted': True,
         'accepted_at': profile.submission_rules_accepted_at.isoformat(),
     })
+
+
+@api_methods('POST')
+@api_user_required
+def acknowledge_native_push_prompt(request):
+    profile = request.user.profile
+    profile.native_push_prompt_seen_at = timezone.now()
+    profile.save(update_fields=['native_push_prompt_seen_at', 'updated_at'])
+    return success({'native_push_prompt_seen': True})
 
 
 def _picture_form(request):
@@ -221,3 +232,14 @@ def unregister_native_push(request):
     if body is None:
         return error('invalid_json', 'A JSON object is required.', 400)
     return success({'removed': native_push_service.unregister_device(request.user, body.get('expo_push_token'))})
+
+
+@api_methods('POST')
+@api_user_required
+def native_push_status(request):
+    body = _json_body(request)
+    if body is None:
+        return error('invalid_json', 'A JSON object is required.', 400)
+    token = body.get('expo_push_token')
+    registered = native_push_service.device_registered(request.user, token)
+    return success({'registered': registered})

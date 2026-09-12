@@ -12,6 +12,7 @@ class UserProfile(models.Model):
     approved_at = models.DateTimeField(null=True, blank=True)
     voting_guide_seen = models.BooleanField(default=False)
     submission_rules_accepted_at = models.DateTimeField(null=True, blank=True)
+    native_push_prompt_seen_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):

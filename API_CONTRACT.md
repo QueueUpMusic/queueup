@@ -353,12 +353,14 @@ dashboard cards or anonymous/authentication behavior.
 | POST | `/api/v1/onboarding/season-welcome/` | Required | Acknowledge season welcome |
 | POST | `/api/v1/onboarding/voting-guide/` | Required | Acknowledge voting guide |
 | POST | `/api/v1/onboarding/submission-rules/` | Required | Accept submission rules |
+| POST | `/api/v1/onboarding/native-push-prompt/` | Required | Record the native notification opt-in prompt choice |
 | POST | `/api/v1/profile/` | Required | Update the authenticated user's display name and/or email |
 | POST,DELETE | `/api/v1/profile/picture/` | Required | Set/remove profile picture |
 | GET | `/api/v1/notifications/` | Required | Get notification preferences |
 | POST,DELETE | `/api/v1/push/subscriptions/` | Required | Manage push subscriptions |
 | POST | `/api/v1/mobile/push/register/` | Required | Register or refresh an Expo native device token |
 | POST | `/api/v1/mobile/push/unregister/` | Required | Unregister the authenticated native device token |
+| POST | `/api/v1/mobile/push/status/` | Required | Check whether this native device token is active for the authenticated user |
 
 Native registration accepts JSON with `expo_push_token`, `platform` (`ios` or
 `android`), and optional `device_id` and `app_version`. The token is unique
@@ -366,6 +368,12 @@ across accounts and is safely reassigned when a different authenticated user
 registers it. Registration is idempotent and re-enables the device. Native
 delivery uses a separate `NativePushDevice`/`NativeNotificationDelivery`
 transport and does not affect browser PushSubscription delivery.
+
+The onboarding response also includes `native_push_prompt_seen`, an
+account-level acknowledgement independent of the submission and voting guides.
+Clients should show the native notification invitation only when this value is
+false. `POST /api/v1/onboarding/native-push-prompt/` records either an opt-in
+or a Not now choice; it does not grant OS permission or register a device.
 
 **`/api/v1/profile/` Request:**
 

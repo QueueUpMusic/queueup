@@ -39,6 +39,12 @@ def unregister_device(user, token):
     return bool(deleted)
 
 
+def device_registered(user, token):
+    if not isinstance(token, str) or not token:
+        return False
+    return NativePushDevice.objects.filter(user=user, expo_push_token=token, enabled=True).exists()
+
+
 def send_native_push(users, event_key, title, body, route='/home/', *, stderr=None):
     if hasattr(users, 'pk'):
         users = [users]
