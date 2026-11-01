@@ -221,6 +221,39 @@ All require `@api_user_required` (authenticated + approved).
 | GET | `/api/v1/profiles/<username>/` | User profile |
 | GET | `/api/v1/profiles/<username>/achievements/` | User achievements |
 
+### Player profile response
+
+`GET /api/v1/profiles/<username>/` returns a player's revealed, eligible
+history. `most_submitted_artists` keeps the existing array shape:
+
+```json
+"most_submitted_artists": [
+  ["Dreamy Tapes", 2],
+  ["Palm Boy", 1]
+]
+```
+
+Each inner array is `[artist_name, submission_count]`. The count is grouped by
+the Spotify artist identity from the submission's structured credits and an
+artist contributes at most once per submission, including collaborations. The
+list is aggregated across all eligible revealed submissions first and then
+limited to the top eight entries. Ordering is descending count with the
+underlying stable Spotify identity used for deterministic ties.
+
+The mobile client must consume `data.most_submitted_artists` directly and must
+not split `data.history[*].artist` on commas, ampersands, “and”, or any other
+display punctuation. `history[*].artist` remains a display string only; it is
+not an artist-boundary contract. The profile endpoint preserves its existing
+approval/privacy, reveal, and `?season=<id>` filtering behavior.
+
+New submissions store ordered Spotify credits as `{id, name}` records. Legacy
+submissions created before this field was populated are excluded from this
+leaderboard until `python manage.py backfill_artist_credits` resolves their
+Spotify track metadata. The command is safe to rerun, throttled by its
+`--sleep` option, and reports tracks that cannot be resolved; it never guesses
+boundaries from the legacy display string. See the deployment notes for the
+backfill command.
+
 ### Season recap
 
 `GET /api/v1/seasons/<id>/recap/` returns the authenticated player's existing

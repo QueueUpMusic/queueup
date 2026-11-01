@@ -42,13 +42,19 @@ def extract_track_id(value):
 def normalize_track(track):
     images = track.get('album', {}).get('images', [])
     artists = track.get('artists', [])
+    artist_credits = [
+        {'id': artist['id'], 'name': artist['name']}
+        for artist in artists
+        if artist.get('id') and artist.get('name')
+    ]
     return {
         'id': track['id'],
         'uri': track['uri'],
         'url': track['external_urls']['spotify'],
         'title': track['name'],
         'artist': ', '.join(a['name'] for a in artists),
-        'artist_ids': [a['id'] for a in artists if a.get('id')],
+        'artist_credits': artist_credits,
+        'artist_ids': [artist['id'] for artist in artist_credits],
         'album': track.get('album', {}).get('name', ''),
         'art': images[0]['url'] if images else '',
         'preview': track.get('preview_url') or '',

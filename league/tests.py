@@ -26,7 +26,11 @@ from django.utils import timezone
 from .models import AchievementUnlock, Badge, HomepageCountdown, NotificationBlast, NotificationDelivery, PushSubscription, Round, Season, SeasonRecapView, SeasonWelcome, Submission, UserBadge, Vote
 from .ranking import competition_rank, ranked_submissions, winner_ids
 from .services.ballots import ballot_for_user
-from .services.profiles import profile_for_user, profile_metrics as service_profile_metrics
+from .services.profiles import (
+    profile_for_user,
+    profile_metrics as service_profile_metrics,
+    submitted_artist_counts,
+)
 from .services.notifications import (
     achievement_notification_events,
     round_notification_events,
@@ -801,6 +805,10 @@ class SubmissionApiTests(QueueUpTestMixin, TestCase):
         self.assertEqual(submission.isrc, 'APIISRC12345')
         self.assertEqual(submission.title, 'API Verified Song')
         self.assertEqual(submission.artist, 'API Artist')
+        self.assertEqual(
+            submission.artist_credits,
+            [{'id': 'artist-api', 'name': 'API Artist'}],
+        )
         self.assertEqual(submission.album, 'API Album')
         self.assertEqual(submission.genres, ['rock'])
         self.assertEqual(
@@ -1948,6 +1956,86 @@ class RankingTests(QueueUpTestMixin, TestCase):
 
 
 class ProfileReadServiceTests(QueueUpTestMixin, TestCase):
+    def revealed_round(self, prompt):
+        now = timezone.now()
+        return Round.objects.create(
+            season=self.season,
+            prompt=prompt,
+            submission_opens=now - timedelta(days=4),
+            submission_deadline=now - timedelta(days=3),
+            voting_deadline=now - timedelta(days=2),
+            reveal_at=now - timedelta(days=1),
+        )
+
+    def artist_submission(self, round_obj, credits, track):
+        return Submission.objects.create(
+            round=round_obj,
+            user=self.alice,
+            spotify_track_id=track,
+            spotify_uri=f'spotify:track:{track}',
+            spotify_url=f'https://open.spotify.com/track/{track}',
+            title=track,
+            artist=', '.join(credit['name'] for credit in credits),
+            artist_credits=credits,
+            artist_ids=[credit['id'] for credit in credits],
+        )
+
+    def test_artist_counts_use_structured_identity_once_per_submission(self):
+        first = self.revealed_round('collaboration one')
+        second = self.revealed_round('collaboration two')
+        comma_artist = self.revealed_round('comma artist')
+        self.artist_submission(first, [
+            {'id': 'dreamy', 'name': 'Dreamy Tapes'},
+            {'id': 'palm', 'name': 'Palm Boy'},
+            {'id': 'dreamy', 'name': 'Dreamy Tapes'},
+        ], 'artist-count-one')
+        self.artist_submission(second, [
+            {'id': 'dreamy', 'name': 'Dreamy Tapes'},
+            {'id': 'jazzo', 'name': 'Mr. Jazzo'},
+        ], 'artist-count-two')
+        self.artist_submission(comma_artist, [
+            {'id': 'earth-wind', 'name': 'Earth, Wind & Fire'},
+        ], 'artist-count-three')
+
+        profile = profile_for_user(self.alice)
+
+        self.assertEqual(profile.artists, [
+            ['Dreamy Tapes', 2],
+            ['Earth, Wind & Fire', 1],
+            ['Mr. Jazzo', 1],
+            ['Palm Boy', 1],
+        ])
+        self.client.force_login(self.alice)
+        response = self.client.get(reverse(
+            'api-v1:profile', args=[self.alice.username],
+        ))
+        self.assertEqual(
+            response.json()['data']['most_submitted_artists'],
+            profile.artists,
+        )
+
+    def test_artist_limit_is_applied_after_aggregation(self):
+        submissions = []
+        for index in range(8):
+            submissions.append(self.artist_submission(
+                self.revealed_round(f'unique {index}'),
+                [{'id': f'unique-{index}', 'name': f'Unique {index}'}],
+                f'unique-track-{index}',
+            ))
+        target_credits = [{'id': 'target', 'name': 'Target Artist'}]
+        submissions.append(self.artist_submission(
+            self.revealed_round('target one'), target_credits, 'target-one',
+        ))
+        submissions.append(self.artist_submission(
+            self.revealed_round('target two'), target_credits, 'target-two',
+        ))
+
+        rows = submitted_artist_counts(submissions, limit=8)
+
+        self.assertEqual(rows[0], ['Target Artist', 2])
+        self.assertEqual(len(rows), 8)
+        self.assertNotIn(['Unique 7', 1], rows)
+
     def test_profile_scores_exclude_an_incomplete_ballot_after_close(self):
         alice_song = self.submission(self.alice, 'profile-alice')
         bob_song = self.submission(self.bob, 'profile-bob')

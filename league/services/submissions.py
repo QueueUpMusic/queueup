@@ -75,6 +75,7 @@ def create_submission(round_obj, user, track_reference):
                 spotify_url=track['url'],
                 title=track['title'],
                 artist=track['artist'],
+                artist_credits=track['artist_credits'],
                 artist_ids=track['artist_ids'],
                 genres=genres,
                 album=track['album'],

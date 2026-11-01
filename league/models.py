@@ -184,6 +184,11 @@ class Submission(models.Model):
     spotify_url = models.URLField()
     title = models.CharField(max_length=240)
     artist = models.CharField(max_length=240)
+    artist_credits = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Ordered Spotify artist credits: [{"id": ..., "name": ...}].',
+    )
     artist_ids = models.JSONField(default=list, blank=True)
     genres = models.JSONField(default=list, blank=True)
     album = models.CharField(max_length=240, blank=True)

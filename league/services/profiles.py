@@ -9,6 +9,36 @@ from ..ranking import ranked_submissions
 from ..voting import counted_vote_ids_for_rounds
 
 
+def submitted_artist_counts(submissions, limit=None):
+    """Count Spotify artist identities, once per submission.
+
+    Only structured credits are eligible.  In particular, the rendered artist
+    string is deliberately not parsed because punctuation is part of an
+    artist's display name (for example, ``Earth, Wind & Fire``).
+    """
+    counts = Counter()
+    names = {}
+    for submission in submissions:
+        seen = set()
+        for credit in submission.artist_credits or []:
+            if not isinstance(credit, dict):
+                continue
+            artist_id = credit.get('id')
+            artist_name = credit.get('name')
+            if not artist_id or not artist_name or artist_id in seen:
+                continue
+            seen.add(artist_id)
+            names.setdefault(artist_id, artist_name)
+        for artist_id in seen:
+            counts[artist_id] += 1
+
+    rows = [
+        [names[artist_id], counts[artist_id]]
+        for artist_id in sorted(counts, key=lambda value: (-counts[value], value))
+    ]
+    return rows if limit is None else rows[:limit]
+
+
 @dataclass(frozen=True)
 class ProfileMetrics:
     submissions: object
@@ -116,7 +146,7 @@ def profile_for_user(user, season_id=None, now=None):
         for submission in submissions
         for genre in (submission.genres or [])
     )
-    artists = Counter(submission.artist for submission in submissions)
+    artists = submitted_artist_counts(submissions, limit=8)
     placements = metrics.placements
     avg_received = Vote.objects.filter(
         submission__in=submissions,
@@ -131,7 +161,7 @@ def profile_for_user(user, season_id=None, now=None):
         podiums=metrics.podiums,
         round_count=submissions.count(),
         genres=genres.most_common(8),
-        artists=artists.most_common(8),
+        artists=artists,
         avg_received=avg_received,
         avg_placement=(
             sum(placements) / len(placements) if placements else 0
