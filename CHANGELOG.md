@@ -2,6 +2,7 @@
 
 ## Version order (latest first)
 
+- v7.2.3
 - v7.2.2
 - v7.2.1
 - v7.1.2
@@ -349,3 +350,9 @@ After deploying, remove the existing QueueUp Home Screen icon and add it again s
 - The denominator includes active approved league members plus active staff and superusers.
 - A person counts as voted only after rating every song they were eligible to rate.
 - No database migration is required.
+# v7.2.3
+
+- Added website-based permanent account deletion at `/account/delete/`.
+- Deleted accounts remove personal records and notification/Spotify credentials while retaining each historical submission and ballot under a separate non-authenticatable `deleted-user` identity.
+- Preserved completed-ballot scoring and excluded deleted identities from active rankings, profiles, achievements, and leaderboards.
+- Added password, username, `DELETE` confirmation, CSRF, rate limiting, session invalidation, pending-account access, and public deletion confirmation.

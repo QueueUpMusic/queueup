@@ -10,6 +10,7 @@ class ApprovalRequiredMiddleware:
     allowed_names = {
         'waiting_approval', 'notification_settings', 'push_subscribe', 'push_unsubscribe',
         'logout', 'terms', 'privacy', 'service_worker', 'health',
+        'account_delete', 'account_deleted',
     }
 
     def __init__(self, get_response):

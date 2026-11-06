@@ -7,9 +7,10 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.contrib import messages
-from django.contrib.auth import login
+from django.contrib.auth import login, logout
 from django.contrib.auth.decorators import login_required, user_passes_test
 from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.db import models
 from django.db.models import Count
 from django.http import HttpResponse, HttpResponseBadRequest, JsonResponse
@@ -21,7 +22,7 @@ from django.views.decorators.http import require_POST
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.cache import never_cache
 
-from .forms import BadgeForm, HomepageCountdownForm, NotificationBlastForm, ProfileForm, ProfilePictureForm, RoundForm, SeasonForm, SignupForm, VoteForm
+from .forms import AccountDeletionForm, BadgeForm, HomepageCountdownForm, NotificationBlastForm, ProfileForm, ProfilePictureForm, RoundForm, SeasonForm, SignupForm, VoteForm
 from .services.achievements import earned_badges, prestige_badges
 from .realtime import broadcast
 from .models import Badge, HomepageCountdown, NotificationBlast, Round, Season, SpotifyConnection, Submission, UserProfile, Vote
@@ -43,6 +44,7 @@ from .services import notifications as notification_service
 from .services import countdowns as countdown_service
 from .services import notification_blasts as blast_service
 from .services import media as media_service
+from .services.account_deletion import delete_account
 from .services import submissions as submission_service
 from .services import votes as vote_service
 from .push import send_user_push
@@ -293,6 +295,30 @@ def profile_edit(request):
         messages.success(request, 'Your profile has been updated.')
         return redirect('stats')
     return render(request, 'league/profile_edit.html', {'form': form})
+
+
+@login_required
+@never_cache
+@ensure_csrf_cookie
+def account_delete(request):
+    form = AccountDeletionForm(request.POST or None, user=request.user)
+    if request.method == 'POST':
+        rate_key = f'account-delete-failures:{request.user.pk}'
+        failures = cache.get(rate_key, 0)
+        if failures >= 5:
+            form.add_error(None, 'Too many unsuccessful attempts. Please try again later.')
+        elif form.is_valid():
+            cache.delete(rate_key)
+            delete_account(request.user)
+            logout(request)
+            return redirect('account_deleted')
+        else:
+            cache.set(rate_key, failures + 1, 15 * 60)
+    return render(request, 'league/account_delete.html', {'form': form})
+
+
+def account_deleted(request):
+    return render(request, 'league/account_deleted.html')
 
 
 def _picture_upload_error(request, message, raw_upload=False):

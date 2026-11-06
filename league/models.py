@@ -5,6 +5,15 @@ from django.db.models import Avg
 from django.utils import timezone
 
 
+class AnonymousParticipant(models.Model):
+    """A non-authenticatable identity retained only for deleted history."""
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return 'deleted-user'
+
+
 class UserProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
     picture = models.ImageField(upload_to='profile_pictures/%Y/%m/', blank=True)
@@ -177,7 +186,11 @@ class Round(models.Model):
 
 class Submission(models.Model):
     round = models.ForeignKey(Round, on_delete=models.CASCADE, related_name='submissions')
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='submissions')
+    user = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='submissions')
+    anonymous_participant = models.ForeignKey(
+        AnonymousParticipant, null=True, blank=True, on_delete=models.PROTECT,
+        related_name='submissions',
+    )
     spotify_track_id = models.CharField(max_length=128)
     isrc = models.CharField(max_length=32, null=True, blank=True, db_index=True)
     spotify_uri = models.CharField(max_length=200)
@@ -201,6 +214,11 @@ class Submission(models.Model):
         constraints = [
             models.UniqueConstraint(fields=['round', 'user'], name='one_submission_per_user_round'),
             models.UniqueConstraint(
+                fields=['round', 'anonymous_participant'],
+                condition=models.Q(anonymous_participant__isnull=False),
+                name='one_anonymous_submission_per_round',
+            ),
+            models.UniqueConstraint(
                 fields=['round', 'isrc'],
                 condition=models.Q(isrc__isnull=False),
                 name='no_duplicate_isrc_per_round',
@@ -219,19 +237,42 @@ class Submission(models.Model):
 
 class Vote(models.Model):
     round = models.ForeignKey(Round, on_delete=models.CASCADE, related_name='votes')
-    voter = models.ForeignKey(User, on_delete=models.CASCADE, related_name='votes')
+    voter = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='votes')
+    anonymous_participant = models.ForeignKey(
+        AnonymousParticipant, null=True, blank=True, on_delete=models.PROTECT,
+        related_name='votes',
+    )
     submission = models.ForeignKey(Submission, on_delete=models.CASCADE, related_name='votes')
     score = models.PositiveSmallIntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        constraints = [models.UniqueConstraint(fields=['voter', 'submission'], name='one_vote_per_submission')]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['voter', 'submission'],
+                condition=models.Q(voter__isnull=False),
+                name='one_vote_per_submission',
+            ),
+            models.UniqueConstraint(
+                fields=['anonymous_participant', 'submission'],
+                condition=models.Q(anonymous_participant__isnull=False),
+                name='one_anonymous_vote_per_submission',
+            ),
+        ]
 
     def clean(self):
         from django.core.exceptions import ValidationError
         if self.submission_id and self.round_id != self.submission.round_id:
             raise ValidationError('Round mismatch.')
-        if self.submission_id and self.voter_id == self.submission.user_id:
+        if (
+            self.submission_id
+            and self.voter_id is not None
+            and self.voter_id == self.submission.user_id
+        ) or (
+            self.submission_id
+            and self.anonymous_participant_id is not None
+            and self.anonymous_participant_id == self.submission.anonymous_participant_id
+        ):
             raise ValidationError('You cannot vote for your own song.')
 
 

@@ -1,4 +1,5 @@
 from django.utils import timezone
+from django.db import models
 
 from .models import Submission, Vote
 
@@ -28,27 +29,46 @@ def voting_progress(round_obj, user):
 
 
 def completed_voter_ids(round_obj):
-    """Return voters who completed every vote they were eligible to cast."""
-    submission_rows = list(
-        Submission.objects.filter(round=round_obj).values_list('id', 'user_id')
-    )
-    submission_ids = {submission_id for submission_id, _user_id in submission_rows}
-    own_submission_by_user = {
-        user_id: submission_id for submission_id, user_id in submission_rows
+    """Return active Django user IDs with complete ballots.
+
+    Anonymous historical ballots are deliberately omitted from this legacy
+    helper; use ``completed_voter_keys`` when calculating result eligibility.
+    """
+    return {
+        key[1] for key in completed_voter_keys(round_obj)
+        if key[0] == 'user'
     }
 
+
+def completed_voter_keys(round_obj):
+    """Return stable, non-merged identities with complete ballots."""
+    submission_rows = list(
+        Submission.objects.filter(round=round_obj).values_list(
+            'id', 'user_id', 'anonymous_participant_id',
+        )
+    )
+    submission_ids = {row[0] for row in submission_rows}
+    owner_by_identity = {}
+    for submission_id, user_id, anonymous_id in submission_rows:
+        if user_id is not None:
+            owner_by_identity[('user', user_id)] = submission_id
+        elif anonymous_id is not None:
+            owner_by_identity[('anonymous', anonymous_id)] = submission_id
+
     votes_by_user = {}
-    for voter_id, submission_id in Vote.objects.filter(round=round_obj).values_list(
-        'voter_id', 'submission_id'
+    for voter_id, anonymous_id, submission_id in Vote.objects.filter(round=round_obj).values_list(
+        'voter_id', 'anonymous_participant_id', 'submission_id'
     ):
         if submission_id in submission_ids:
-            votes_by_user.setdefault(voter_id, set()).add(submission_id)
+            key = ('user', voter_id) if voter_id is not None else ('anonymous', anonymous_id)
+            if key[1] is not None:
+                votes_by_user.setdefault(key, set()).add(submission_id)
 
     completed = set()
-    for voter_id, voted_ids in votes_by_user.items():
-        eligible_ids = submission_ids - ({own_submission_by_user[voter_id]} if voter_id in own_submission_by_user else set())
+    for voter_key, voted_ids in votes_by_user.items():
+        eligible_ids = submission_ids - ({owner_by_identity[voter_key]} if voter_key in owner_by_identity else set())
         if eligible_ids and eligible_ids.issubset(voted_ids):
-            completed.add(voter_id)
+            completed.add(voter_key)
     return completed
 
 
@@ -64,10 +84,14 @@ def counted_vote_ids_for_round(round_obj, now=None):
     votes = Vote.objects.filter(round=round_obj)
     if now < round_obj.voting_deadline:
         return set(votes.values_list('id', flat=True))
-    completed_ids = completed_voter_ids(round_obj)
-    if not completed_ids:
+    completed_keys = completed_voter_keys(round_obj)
+    if not completed_keys:
         return set()
-    return set(votes.filter(voter_id__in=completed_ids).values_list('id', flat=True))
+    active_ids = [key[1] for key in completed_keys if key[0] == 'user']
+    anonymous_ids = [key[1] for key in completed_keys if key[0] == 'anonymous']
+    return set(votes.filter(
+        models.Q(voter_id__in=active_ids) | models.Q(anonymous_participant_id__in=anonymous_ids)
+    ).values_list('id', flat=True))
 
 
 def counted_vote_ids_for_rounds(rounds, now=None):

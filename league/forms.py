@@ -1,6 +1,7 @@
 from django import forms
 from django.contrib.auth.forms import AuthenticationForm, UserCreationForm
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from .models import Badge, HomepageCountdown, NotificationBlast, Round, Season, UserProfile, Vote
@@ -24,6 +25,12 @@ class SignupForm(UserCreationForm):
             user.save()
         return user
 
+    def clean_username(self):
+        username = self.cleaned_data['username']
+        if username.casefold() == 'deleted-user':
+            raise ValidationError('That username is reserved.')
+        return username
+
 
 class QueueUpAuthenticationForm(AuthenticationForm):
     """Authenticate by username, or by an unambiguous email address."""
@@ -44,6 +51,42 @@ class QueueUpAuthenticationForm(AuthenticationForm):
                 # Zero or multiple email matches deliberately remain invalid
                 # through AuthenticationForm's normal authentication path.
         return super().clean()
+
+
+class AccountDeletionForm(forms.Form):
+    username = forms.CharField(
+        max_length=150, label='Username', widget=forms.TextInput(attrs={'autocomplete': 'username'}),
+    )
+    password = forms.CharField(
+        label='Password', widget=forms.PasswordInput(attrs={'autocomplete': 'current-password'}),
+    )
+    confirmation = forms.CharField(
+        label='Confirmation phrase',
+        help_text='Type DELETE to permanently remove this account.',
+        widget=forms.TextInput(attrs={'autocomplete': 'off'}),
+    )
+
+    def __init__(self, *args, user=None, **kwargs):
+        self.user = user
+        super().__init__(*args, **kwargs)
+
+    def clean_username(self):
+        value = self.cleaned_data['username'].strip()
+        if not self.user or value.casefold() != self.user.username.casefold():
+            raise ValidationError('Enter the username for the signed-in account.')
+        return value
+
+    def clean_password(self):
+        password = self.cleaned_data['password']
+        if not self.user or not self.user.check_password(password):
+            raise ValidationError('The password is incorrect.')
+        return password
+
+    def clean_confirmation(self):
+        value = self.cleaned_data['confirmation'].strip()
+        if value != 'DELETE':
+            raise ValidationError('Type DELETE exactly to confirm account deletion.')
+        return value
 
 
 class VoteForm(forms.ModelForm):

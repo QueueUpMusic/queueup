@@ -11,6 +11,13 @@ def iso(value):
 
 
 def user_summary(user):
+    if not user:
+        return {
+            'id': None,
+            'username': 'deleted-user',
+            'display_name': 'deleted-user',
+            'picture_url': None,
+        }
     return {
         'id': user.pk,
         'username': user.username,

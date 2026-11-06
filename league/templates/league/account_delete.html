@@ -1,0 +1,23 @@
+{% extends 'league/base.html' %}
+{% block title %}Delete account · QueueUp{% endblock %}
+{% block content %}
+<section class="page-heading"><div><span class="eyebrow">Your account</span><h1>Delete your QueueUp account</h1><p>This is permanent and cannot be undone. Review the details below before continuing.</p></div></section>
+<section class="card form-card account-delete-card">
+  <div class="account-delete-warning">
+    <h2>What will happen</h2>
+    <ul>
+      <li>Your account and personal information will be deleted.</li>
+      <li>Your profile picture, points, achievements, connections, and notifications will be removed.</li>
+      <li>Previous song submissions may remain in league history under <code>deleted-user</code>.</li>
+      <li>Your old account cannot be recovered. You may create a new account later, but your previous progress will not return.</li>
+    </ul>
+  </div>
+  <div class="account-delete-identity"><span class="eyebrow">Signed-in account</span><strong>@{{ user.username }}</strong><span>{{ user.first_name|default:'No display name' }}{% if user.email %} · {{ user.email }}{% endif %}</span></div>
+  <form method="post" action="{% url 'account_delete' %}" class="app-form" autocomplete="off">
+    {% csrf_token %}
+    {{ form.non_field_errors }}
+    {{ form.as_p }}
+    <div class="form-actions"><button class="button danger account-delete-button" type="submit">Permanently delete my account</button><a class="button ghost" href="{% url 'profile_edit' %}">Cancel</a></div>
+  </form>
+</section>
+{% endblock %}

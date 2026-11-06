@@ -109,4 +109,4 @@ def create_submission(request, pk):
     return success({
         'submission': submission_track(submission),
         'submission_bonus_points': SUBMISSION_BONUS_POINTS,
-    }, status=201)
+    })

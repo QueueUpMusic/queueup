@@ -22,6 +22,11 @@
       {% endif %}
     </div>
   </section>
+
+  <section class="card form-card profile-editor account-danger-card">
+    <div><span class="eyebrow">Permanent action</span><h2>Delete your account</h2><p class="muted">Permanently remove your account and personal information. Your historical songs may remain anonymously as <code>deleted-user</code>.</p></div>
+    <a class="button ghost danger" href="{% url 'account_delete' %}">Delete Account</a>
+  </section>
 </div>
 <script>
 (() => {

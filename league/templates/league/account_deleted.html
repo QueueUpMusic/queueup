@@ -1,0 +1,5 @@
+{% extends 'league/base.html' %}
+{% block title %}Account deleted · QueueUp{% endblock %}
+{% block content %}
+<section class="card centered account-deleted-card"><div class="big-icon" aria-hidden="true">✓</div><h1>Your account has been deleted.</h1><p>Your QueueUp account and personal information have been removed. Any historical submissions that remain are anonymously attributed to <code>deleted-user</code>.</p><a class="button primary" href="{% url 'landing' %}">Return to QueueUp</a></section>
+{% endblock %}
